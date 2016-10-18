@@ -1,0 +1,9 @@
+Dockerfile*
+*.sh
+docs
+debian
+.git
+.tox
+env*
+**/*.pyc
+*.pyo
