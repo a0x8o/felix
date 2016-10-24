@@ -1,3 +1,4 @@
+<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
 # -*- coding: utf-8 -*-
 # Copyright (c) 2014-2016 Tigera, Inc. All rights reserved.
 # Copyright (c) 2015 Cisco Systems.  All Rights Reserved.
@@ -948,3 +949,7 @@ def validate_ipam_pool(pool_id, pool, ip_version):
 
     if issues:
         raise ValidationFailed(','.join(issues))
+=======
+
+AGENT_TYPE_CALICO = 'Calico agent'
+>>>>>>> Project Calico version 0.1

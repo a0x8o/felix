@@ -1,3 +1,4 @@
+<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
 calico (1.4.3-1-xenial) xenial; urgency=low
 
   * calico release (from Git commit 2a477e9).
@@ -858,6 +859,8 @@ calico (0.2) trusty; urgency=medium
 
  -- Neil Jerram <nj@metaswitch.com>  Tue, 01 Jul 2014 15:17:52 +0100
 
+=======
+>>>>>>> Project Calico version 0.1
 calico (0.1) trusty; urgency=medium
 
   * Initial release.
