@@ -1,10 +1,7 @@
 usr/lib/python2.7/dist-packages/calico*
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
 usr/bin/calico-diags usr/bin
 usr/bin/calico-gen-bird-conf.sh usr/bin
 usr/bin/calico-gen-bird6-conf.sh usr/bin
 usr/bin/calico-gen-bird-mesh-conf.sh usr/bin
 usr/bin/calico-gen-bird6-mesh-conf.sh usr/bin
 usr/share/calico/* usr/share/calico
-=======
->>>>>>> Project Calico version 0.1

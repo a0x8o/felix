@@ -1,5 +1,4 @@
 #! /bin/bash
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
 # Copyright (c) 2016 Tigera, Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,11 +22,6 @@ fi
 
 BIRD_CONF_TEMPLATE=/usr/share/calico/bird/calico-bird.conf.template
 BIRD_CONF_PEER_TEMPLATE=/usr/share/calico/bird/calico-bird-peer.conf.template
-=======
-
-BIRD_CONF=/etc/bird/bird.conf
-BIRD_CONF_TEMPLATE=/usr/share/calico/bird/calico-bird.conf.template
->>>>>>> Project Calico version 0.1
 
 # Require 3 arguments.
 [ $# -eq 3 ] || cat <<EOF
@@ -38,11 +32,7 @@ where
   <my-ip-address> is the external IP address of the local machine
   <rr-ip-address> is the IP address of the route reflector that
       the local BIRD should peer with
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
   <as-number> is the BGP AS number that the route reflector is using.
-=======
-  <as-number> is the BGP AS number that the route relector is using.
->>>>>>> Project Calico version 0.1
 
 Please specify exactly these 3 required arguments.
 
@@ -54,7 +44,6 @@ my_ip_address=$1
 rr_ip_address=$2
 as_number=$3
 
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
 # Generate peer-independent BIRD config.
 mkdir -p $(dirname $BIRD_CONF)
 sed -e "
@@ -72,17 +61,5 @@ s/@AS_NUMBER@/$as_number/;
 
 echo BIRD configuration generated at $BIRD_CONF
 
-=======
-# Generate BIRD config file.
-sed -e "
-s/@MY_IP_ADDRESS@/$my_ip_address/;
-s/@RR_IP_ADDRESS@/$rr_ip_address/;
-s/@AS_NUMBER@/$as_number/;
-" < $BIRD_CONF_TEMPLATE > $BIRD_CONF
-
-echo BIRD configuration generated at $BIRD_CONF
-
-# Restart BIRD.
->>>>>>> Project Calico version 0.1
 service bird restart
 echo BIRD restarted

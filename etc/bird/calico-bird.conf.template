@@ -1,7 +1,6 @@
 
 router id @MY_IP_ADDRESS@;
 
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
 # We are only going to export routes from Calico interfaces.
 # Currently, 'tap*' is used by the OpenStack implimentation
 # and 'cali*' is used by the docker implimentation.
@@ -19,13 +18,6 @@ filter export_bgp {
     if  net != 0.0.0.0/0 then accept;
   }
   reject;
-=======
-filter import_kernel {
-if ( net != 0.0.0.0/0 ) then {
-   accept;
-   }
-   reject;
->>>>>>> Project Calico version 0.1
 }
 
 # Configure synchronization between BIRD's routing tables and the
@@ -33,45 +25,18 @@ if ( net != 0.0.0.0/0 ) then {
 protocol kernel {
   learn;          # Learn all alien routes from the kernel
   persist;        # Don't remove routes on bird shutdown
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
   scan time 2;    # Scan kernel routing table every 2 seconds
   import all;
   graceful restart;
-=======
-  scan time 2;    # Scan kernel routing table every 20 seconds
-  device routes;
-  import filter import_kernel;
->>>>>>> Project Calico version 0.1
   export all;     # Default is export none
 }
 
 # Watch interface up/down events.
 protocol device {
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
   scan time 2;    # Scan interfaces every 2 seconds
-=======
-  scan time 2;    # Scan interfaces every 10 seconds
->>>>>>> Project Calico version 0.1
 }
 
 protocol direct {
    debug all;
-<<<<<<< 1a1a13257e73663138a37a99594c68870b751016
    interface "-dummy0", "dummy1", "eth*", "em*", "en*", "br-mgmt";
-=======
-   interface "-dummy0", "dummy1", "eth0";
-}
-
-# Peer with route reflector.
-protocol bgp N1 {
-  description "Connection to BGP route reflector";
-  local as @AS_NUMBER@;
-  neighbor @RR_IP_ADDRESS@ as @AS_NUMBER@;
-  multihop;
-  import all;
-  export all;
-  next hop self;    # Disable next hop processing and always advertise our
-                    # local address as nexthop
-  source address @MY_IP_ADDRESS@;  # The local address we use for the TCP connection
->>>>>>> Project Calico version 0.1
 }
