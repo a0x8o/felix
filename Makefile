@@ -40,6 +40,9 @@ help:
 all: pyinstaller deb rpm felix-docker-image
 test: ut
 
+# re-define default --compare-branch=origin/master to some custom name
+UT_COMPARE_BRANCH?=
+
 # Extract current version from the debian-style changelog and replace the
 # placeholders with the stream name.
 DEB_VERSION:=$(shell grep felix debian/changelog | \
@@ -227,11 +230,9 @@ python/calico/felix/felixbackend_pb2.py: go/felix/proto/felixbackend.proto
 update-vendor:
 	cd go && glide up --strip-vendor
 
-# Shortcut for building the go vendor directory.
+# vendor is a shortcut for force rebuilding the go vendor directory.
 .PHONY: vendor
-vendor: go/vendor
-
-go/vendor go/vendor/.up-to-date: go/glide.lock
+vendor go/vendor go/vendor/.up-to-date: go/glide.lock
 	# Make sure the docker image exists.  Since it's a PHONY, we can't add it
 	# as a dependency or this job will run every time.  Docker does its own
 	# freshness checking for us.
@@ -271,6 +272,8 @@ bin/calico-felix: $(GO_FILES) \
 	    -v $${PWD}:/go/src/github.com/projectcalico/felix:rw \
 	    calico/build-felix-golang \
 	    go build -o $@ $(LDFLAGS) "./go/felix/felix.go"
+	# Check that the executable is correctly statically linked.
+	ldd bin/calico-felix | grep -q "not a dynamic executable"
 
 # Build the pyinstaller bundle, which is an output artefact in its own right
 # as well as being the input to our Deb and RPM builds.
@@ -344,7 +347,7 @@ python-ut: python/calico/felix/felixbackend_pb2.py
 	# Do the install as root.
 	docker exec felix-ut sh -c 'pip install -e .'
 	# Run the UTs as non-root.
-	docker exec --user $(MY_UID):$(MY_GID) felix-ut ./run-unit-test.sh
+	docker exec --user $(MY_UID):$(MY_GID) felix-ut sh -c 'COMPARE_BRANCH=$(UT_COMPARE_BRANCH) ./run-unit-test.sh'
 	# Tear down the container.
 	docker rm -f felix-ut
 
@@ -355,7 +358,6 @@ go-ut go/combined.coverprofile: go/vendor/.up-to-date $(GO_FILES)
 	$(DOCKER_RUN_RM) \
 	    --net=host \
 	    -v $${PWD}:/go/src/github.com/projectcalico/felix:rw \
-	    -v $$HOME/.glide:/.glide:rw \
 	    -w /go/src/github.com/projectcalico/felix/go \
 	    calico/build-felix-golang \
 	    ./run-coverage
@@ -397,6 +399,8 @@ clean:
 	       docker-build-images/passwd \
 	       docker-build-images/group \
 	       go/docs/calc.pdf \
+	       go/.glide \
+	       go/vendor \
 	       python/.tox \
 	       htmlcov \
 	       python/htmlcov
