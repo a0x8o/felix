@@ -1,8 +1,34 @@
-felix (2.0.0~~__SNAPSHOT__~__STREAM__) __STREAM__; urgency=low
+felix (2.0.0~beta.3-__STREAM__) __STREAM__; urgency=low
 
-  * Development release.
+  * felix release (from Git commit 2b49e4b).
+    - Pin logrus to 4b6ea73.
+    - Pin libcalico-go to v1.0.0-beta-rc2.
+    - Use 'glide up' to update other Go dependencies.
 
- -- Shaun Crampton <shaun@tigera.io>  Mon, 5 Sep 2016 15:24:06 +0100
+ -- Neil Jerram <neil@tigera.io>  Mon, 07 Nov 2016 12:12:58 +0000
+
+felix (2.0.0~beta.2-__STREAM__) __STREAM__; urgency=low
+
+  * fix that net-outgoing was not being honoured.
+
+ -- Shaun Crampton <shaun@tigera.io>  Fri, 04 Nov 2016 18:17:00 +0000
+
+felix (2.0.0~beta-__STREAM__) __STREAM__; urgency=low
+
+  * felix release (from Git commit 3f4882e).
+    - Separate Felix into dataplane driver and dataplane-independent
+      parts.  (The initial dataplane driver is the one that uses Linux
+      iptables and routing commands; this division will allow us to target
+      other dataplane implementations.)
+    - Rewrite the dataplane-independent part of Felix in Go, for improved
+      performance.
+    - Update calico-diags to collect Upstart logs.
+    - Improve usage reporting: extra stats, better version number.
+    - Improve endpoint status reporting.
+    - Support Kubernetes backend.
+    - Build system improvements.
+
+ -- Neil Jerram <neil@tigera.io>  Fri, 04 Nov 2016 13:36:49 +0000
 
 felix (1.4.4-1-xenial) xenial; urgency=low
 
