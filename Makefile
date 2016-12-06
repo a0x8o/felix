@@ -368,6 +368,13 @@ go-cover-report: go/combined.coverprofile
 	  column -t | \
 	  grep -v '100\.0%'
 
+bin/calico-felix.transfer-url: bin/calico-felix
+	curl --upload-file bin/calico-felix https://transfer.sh/calico-felix > $@
+
+.PHONY: patch-script
+patch-script: bin/calico-felix.transfer-url
+	utils/make-patch-script.sh $$(cat bin/calico-felix.transfer-url)
+
 # Generate a diagram of Felix's internal calculation graph.
 go/docs/calc.pdf: go/docs/calc.dot
 	cd go/docs/ && dot -Tpdf calc.dot -o calc.pdf
@@ -407,13 +414,15 @@ release-once-tagged:
 	@echo
 	$(MAKE) pyinstaller calico/felix
 	docker tag calico/felix calico/felix:$(VERSION)
+	docker tag calico/felix quay.io/calico/felix:$(VERSION)
 	@echo
 	@echo "Felix release artifacts have been built:"
 	@echo
-	@echo "- PyInstaller bundle: $(BUNDLE_FILENAME)"
+	@echo "- PyInstaller bundle:     $(BUNDLE_FILENAME)"
 	@echo "- Docker container image: calico/felix:$(VERSION)"
+	@echo "- Same, tagged for Quay:  quay.io/calico/felix:$(VERSION)"
 	@echo
-	@echo "Now to publish this release:"
+	@echo "Now to publish this release to Github:"
 	@echo
 	@echo "- Push the new tag ($(VERSION)) to https://github.com/projectcalico/felix"
 	@echo "- Go to https://github.com/projectcalico/felix/releases/tag/$(VERSION)"
@@ -423,6 +432,11 @@ release-once-tagged:
 	@echo "- Attach the PyInstaller bundle"
 	@echo "- Click the 'This is a pre-release' checkbox, if appropriate"
 	@echo "- Click 'Publish release'"
+	@echo
+	@echo "Then, push the docker images to Dockerhub and Quay:"
+	@echo
+	@echo "- docker push calico/felix:$(VERSION)"
+	@echo "- docker push quay.io/calico/felix:$(VERSION)"
 	@echo
 	@echo "If you also want to build Debian/Ubuntu and RPM packages for"
 	@echo "the new release, use 'make deb' and 'make rpm'."
