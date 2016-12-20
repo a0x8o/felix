@@ -103,6 +103,7 @@ class FelixIptablesGenerator(FelixPlugin):
         self.FAILSAFE_INBOUND_PORTS = config.FAILSAFE_INBOUND_PORTS
         self.FAILSAFE_OUTBOUND_PORTS = config.FAILSAFE_OUTBOUND_PORTS
         self.ACTION_ON_DROP = config.ACTION_ON_DROP
+        self.LOG_PREFIX = config.LOG_PREFIX
 
     def raw_rpfilter_failed_chain(self, ip_version):
         """
@@ -427,7 +428,10 @@ class FelixIptablesGenerator(FelixPlugin):
                 "--append %s --out-interface %s --match conntrack "
                 "--ctstate RELATED,ESTABLISHED --jump ACCEPT" %
                 (CHAIN_FORWARD, iface_match),
+            ])
 
+        for iface_match in self.IFACE_MATCH:
+            forward_chain.extend([
                 # Then, for traffic from a workload interface, jump to the
                 # from endpoint chain.  It will either DROP the packet or,
                 # if policy allows, return it to this chain for further
@@ -441,7 +445,10 @@ class FelixIptablesGenerator(FelixPlugin):
                 # the "from" and "to" chains.
                 "--append %s --jump %s --out-interface %s" %
                 (CHAIN_FORWARD, CHAIN_TO_ENDPOINT, iface_match),
+            ])
 
+        for iface_match in self.IFACE_MATCH:
+            forward_chain.extend([
                 # Finally, if the packet is from/to a workload and it passes
                 # both the "from" and "to" chains without being dropped, it
                 # must be allowed by policy; ACCEPT it.
@@ -450,6 +457,7 @@ class FelixIptablesGenerator(FelixPlugin):
                 "--append %s --jump ACCEPT --out-interface %s" %
                 (CHAIN_FORWARD, iface_match),
             ])
+
         return forward_chain, set([CHAIN_FROM_ENDPOINT, CHAIN_TO_ENDPOINT])
 
     def endpoint_chain_names(self, endpoint_suffix):
@@ -659,7 +667,7 @@ class FelixIptablesGenerator(FelixPlugin):
 
         if self.ACTION_ON_DROP.startswith("LOG-"):
             # log-and-accept, log-and-drop.
-            log_spec = '--jump LOG --log-prefix "calico-drop: " --log-level 4'
+            log_spec = '--jump LOG --log-prefix "%s: " --log-level 4' % self.LOG_PREFIX
             log_rule = " ".join(
                 [p for p in [ipt_action, chain_name, rule_spec, log_spec,
                              comment_str] if p is not None]

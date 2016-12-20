@@ -195,6 +195,10 @@ class Config(object):
                            "One of 'DROP', 'ACCEPT', 'LOG-and-DROP', "
                            "'LOG-and-ACCEPT'.",
                            "DROP")
+        self.add_parameter("LogPrefix",
+                           "Prefix of the iptables logged packets. Defaults to "
+                           "calico-drop",
+                           "calico-drop")
         self.add_parameter("IgnoreLooseRPF",
                            "If set to true, Felix will ignore the kernel's "
                            "RPF check setting.  If set to false, Felix will "
@@ -273,6 +277,10 @@ class Config(object):
                            "attempt to detect whether the system supports "
                            "IPv6 and use it if it does.",
                            "auto")
+        self.add_parameter("ChainInsertMode",
+                           "Whether to insert the felix chains or append them."
+                           "one of: insert, append. Defaults to insert.",
+                           "insert")
 
         # The following setting determines which flavour of Iptables Generator
         # plugin is loaded.  Note: this plugin support is currently highly
@@ -342,8 +350,10 @@ class Config(object):
         self.FAILSAFE_OUTBOUND_PORTS = \
             self.parameters["FailsafeOutboundHostPorts"].value
         self.ACTION_ON_DROP = self.parameters["DropActionOverride"].value
+        self.LOG_PREFIX = self.parameters["LogPrefix"].value
         self.IGNORE_LOOSE_RPF = self.parameters["IgnoreLooseRPF"].value
         self.IPV6_SUPPORT = self.parameters["Ipv6Support"].value.lower()
+        self.CHAIN_INSERT_MODE = self.parameters["ChainInsertMode"].value
 
         self._validate_cfg(final=final)
 
@@ -531,6 +541,12 @@ class Config(object):
             log.warning("Unrecognized value for Ipv6Support (%s), "
                         "defaulting to 'auto'", self.IPV6_SUPPORT)
             self.IPV6_SUPPORT = "auto"
+
+        if self.CHAIN_INSERT_MODE not in ("insert", "append"):
+            raise ConfigException(
+                "Invalid field value",
+                self.parameters["ChainInsertMode"]
+            )
 
         if not final:
             # Do not check that unset parameters are defaulted; we have more
