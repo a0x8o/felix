@@ -17,8 +17,19 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"reflect"
+	"syscall"
+	"time"
+
 	log "github.com/Sirupsen/logrus"
 	"github.com/docopt/docopt-go"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/projectcalico/felix/buildinfo"
 	"github.com/projectcalico/felix/calc"
 	"github.com/projectcalico/felix/config"
@@ -34,15 +45,6 @@ import (
 	"github.com/projectcalico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/libcalico-go/lib/backend/model"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
-	"os/signal"
-	"reflect"
-	"syscall"
-	"time"
 )
 
 const usage = `Felix, the Calico per-host daemon.
@@ -336,7 +338,7 @@ func servePrometheusMetrics(port int) {
 		err := http.ListenAndServe(fmt.Sprintf(":%v", port), nil)
 		log.WithError(err).Error(
 			"Prometheus metrics endpoint failed, trying to restart it...")
-		time.Sleep(1)
+		time.Sleep(1 * time.Second)
 	}
 }
 

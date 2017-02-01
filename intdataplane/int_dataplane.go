@@ -15,7 +15,12 @@
 package intdataplane
 
 import (
+	"reflect"
+	"time"
+
 	log "github.com/Sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/projectcalico/felix/ifacemonitor"
 	"github.com/projectcalico/felix/ipsets"
 	"github.com/projectcalico/felix/iptables"
@@ -24,8 +29,28 @@ import (
 	"github.com/projectcalico/felix/routetable"
 	"github.com/projectcalico/felix/rules"
 	"github.com/projectcalico/felix/set"
-	"time"
 )
+
+var (
+	countDataplaneSyncErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "felix_int_dataplane_failures",
+		Help: "Number of times dataplane updates failed and will be retried.",
+	})
+	countMessages = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "felix_int_dataplane_messages",
+		Help: "Number dataplane messages by type.",
+	}, []string{"type"})
+	histApplyTime = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "felix_int_dataplane_apply_time_seconds",
+		Help: "Time in seconds that it took to apply a dataplane update.",
+	})
+)
+
+func init() {
+	prometheus.MustRegister(countDataplaneSyncErrors)
+	prometheus.MustRegister(histApplyTime)
+	prometheus.MustRegister(countMessages)
+}
 
 type Config struct {
 	DisableIPv6          bool
@@ -377,6 +402,7 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 		select {
 		case msg := <-d.toDataplane:
 			log.WithField("msg", msg).Info("Received update from calculation graph")
+			d.recordMsgStat(msg)
 			for _, mgr := range d.allManagers {
 				mgr.OnUpdate(msg)
 			}
@@ -409,9 +435,23 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 		}
 
 		if datastoreInSync && d.dataplaneNeedsSync {
+			applyStart := time.Now()
 			d.apply()
+			applyEnd := time.Now()
+			if applyEnd.After(applyStart) {
+				// Avoid a negative interval in case the clock jumps.
+				histApplyTime.Observe(applyEnd.Sub(applyStart).Seconds())
+			}
+			if d.dataplaneNeedsSync {
+				countDataplaneSyncErrors.Inc()
+			}
 		}
 	}
+}
+
+func (d *InternalDataplane) recordMsgStat(msg interface{}) {
+	typeName := reflect.ValueOf(msg).Elem().Type().Name()
+	countMessages.WithLabelValues(typeName).Inc()
 }
 
 func (d *InternalDataplane) apply() {
