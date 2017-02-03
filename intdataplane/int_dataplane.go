@@ -15,7 +15,11 @@
 package intdataplane
 
 import (
+	"io/ioutil"
+	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -53,9 +57,10 @@ func init() {
 }
 
 type Config struct {
-	DisableIPv6          bool
+	IPv6Enabled          bool
 	RuleRendererOverride rules.RuleRenderer
 	IPIPMTU              int
+	IgnoreLooseRPF       bool
 
 	MaxIPSetSize int
 
@@ -63,6 +68,8 @@ type Config struct {
 	IptablesInsertMode      string
 
 	RulesConfig rules.Config
+
+	StatusReportingInterval time.Duration
 }
 
 // InternalDataplane implements an in-process Felix dataplane driver based on iptables
@@ -183,7 +190,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 	routeTableV4 := routetable.New(config.RulesConfig.WorkloadIfacePrefixes, 4)
 	dp.routeTables = append(dp.routeTables, routeTableV4)
 
-	dp.endpointStatusCombiner = newEndpointStatusCombiner(dp.fromDataplane, !config.DisableIPv6)
+	dp.endpointStatusCombiner = newEndpointStatusCombiner(dp.fromDataplane, config.IPv6Enabled)
 
 	dp.RegisterManager(newIPSetsManager(ipSetRegV4, config.MaxIPSetSize))
 	dp.RegisterManager(newPolicyManager(rawTableV4, filterTableV4, ruleRenderer, 4))
@@ -202,7 +209,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		dp.ipipManager = newIPIPManager(ipSetRegV4, config.MaxIPSetSize)
 		dp.RegisterManager(dp.ipipManager) // IPv4-only
 	}
-	if !config.DisableIPv6 {
+	if config.IPv6Enabled {
 		natTableV6 := iptables.NewTable(
 			"nat",
 			6,
@@ -337,7 +344,8 @@ func (d *InternalDataplane) RecvMessage() (interface{}, error) {
 func (d *InternalDataplane) loopUpdatingDataplane() {
 	log.Info("Started internal iptables dataplane driver")
 
-	// TODO Check global RPF value is sane (can't be "loose").
+	// Check/configure global kernel parameters.
+	d.configureKernel()
 
 	// Endure that the default value of rp_filter is set to "strict" for newly-created
 	// interfaces.  This is required to prevent a race between starting an interface and
@@ -455,6 +463,69 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 	}
 }
 
+func (d *InternalDataplane) configureKernel() {
+	// For IPv4, we rely on the kernel's reverse path filtering to prevent workloads from
+	// spoofing their IP addresses.
+	//
+	// The RPF check for a particular interface is controlled by several sysctls:
+	//
+	//     - ipv4.conf.all.rp_filter is a global override
+	//     - ipv4.conf.default.rp_filter controls the value that is set on a newly created
+	//       interface
+	//     - ipv4.conf.<interface>.rp_filter controls a particular interface.
+	//
+	// The algorithm for combining the global override and per-interface values is to take the
+	// *numeric* maximum between the two.  The values are: 0=off, 1=strict, 2=loose.  "loose"
+	// is not suitable for Calico since it would allow workloads to spoof packets from other
+	// workloads on the same host.  Hence, we need the global override to be <=1 or it would
+	// override the per-interface setting to "strict" that we require.
+	//
+	// Unless the IgnoreLooseRPF flag is set, we bail out rather than simply setting it
+	// because setting 2, "loose", is unusual and it is likely to have been set deliberately.
+	rpFilter, err := readRPFilter()
+	if err != nil {
+		logCxt := log.WithError(err)
+		if d.config.IgnoreLooseRPF {
+			logCxt.Error("Failed to read kernel's rp_filter value from /proc/sys. " +
+				"Ignoring due to IgnoreLooseRPF setting.")
+		} else {
+			logCxt.Fatal("Failed to read kernel's rp_filter value from /proc/sys")
+		}
+	} else if rpFilter > 1 {
+		if d.config.IgnoreLooseRPF {
+			log.Warn("Kernel's RPF check is set to 'loose' and IgnoreLooseRPF " +
+				"set to true.  Calico will not be able to prevent workloads " +
+				"from spoofing their source IP.  Please ensure that some " +
+				"other anti-spoofing mechanism is in place (such as running " +
+				"only non-privileged containers).")
+		} else {
+			log.Fatal("Kernel's RPF check is set to 'loose'.  This would " +
+				"allow endpoints to spoof their IP address.  Calico " +
+				"requires net.ipv4.conf.all.rp_filter to be set to " +
+				"0 or 1. If you require loose RPF and you are not concerned " +
+				"about spoofing, this check can be disabled by setting the " +
+				"IgnoreLooseRPF configuration parameter to 'true'.")
+		}
+	}
+
+	// Make sure the default for new interfaces is set to strict checking so that there's no
+	// race when a new interface is added and felix hasn't configured it yet.
+	writeProcSys("/proc/sys/net/ipv4/conf/default/rp_filter", "1")
+}
+
+func readRPFilter() (value int64, err error) {
+	f, err := os.Open("/proc/sys/net/ipv4/conf/all/rp_filter")
+	if err != nil {
+		return
+	}
+	rpFilterBytes, err := ioutil.ReadAll(f)
+	if err != nil {
+		return
+	}
+	value, err = strconv.ParseInt(strings.Trim(string(rpFilterBytes), "\n"), 10, 64)
+	return
+}
+
 func (d *InternalDataplane) recordMsgStat(msg interface{}) {
 	typeName := reflect.ValueOf(msg).Elem().Type().Name()
 	countMessages.WithLabelValues(typeName).Inc()
@@ -524,9 +595,14 @@ func (d *InternalDataplane) apply() {
 
 func (d *InternalDataplane) loopReportingStatus() {
 	log.Info("Started internal status report thread")
+	if d.config.StatusReportingInterval <= 0 {
+		log.Info("Process status reports disabled")
+		return
+	}
 	start := time.Now()
+	// Wait before first report so that we don't check in if we're in a tight cyclic restart.
+	time.Sleep(10 * time.Second)
 	for {
-		time.Sleep(10 * time.Second)
 		now := time.Now()
 		uptimeNanos := float64(now.Sub(start))
 		uptimeSecs := uptimeNanos / 1000000000
@@ -534,6 +610,7 @@ func (d *InternalDataplane) loopReportingStatus() {
 			IsoTimestamp: now.UTC().Format(time.RFC3339),
 			Uptime:       uptimeSecs,
 		}
+		time.Sleep(d.config.StatusReportingInterval)
 	}
 }
 
