@@ -33,6 +33,14 @@ import (
 	"github.com/projectcalico/felix/routetable"
 	"github.com/projectcalico/felix/rules"
 	"github.com/projectcalico/felix/set"
+	"github.com/projectcalico/felix/throttle"
+)
+
+const (
+	// msgPeekLimit is the maximum number of messages we'll try to grab from the to-dataplane
+	// channel before we apply the changes.  Higher values allow us to batch up more work on
+	// the channel for greater throughput when we're under load (at cost of higher latency).
+	msgPeekLimit = 100
 )
 
 var (
@@ -47,6 +55,17 @@ var (
 	histApplyTime = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "felix_int_dataplane_apply_time_seconds",
 		Help: "Time in seconds that it took to apply a dataplane update.",
+		Buckets: []float64{
+			0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
+		},
+	})
+	histBatchSize = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "felix_int_dataplane_msg_batch_size",
+		Help: "Number of messages processed in each batch. Higher values indicate we're " +
+			"doing more batching to try to keep up.",
+		Buckets: []float64{
+			1, 2, 5, 10, 20, 50,
+		},
 	})
 
 	processStartTime time.Time
@@ -56,6 +75,7 @@ func init() {
 	prometheus.MustRegister(countDataplaneSyncErrors)
 	prometheus.MustRegister(histApplyTime)
 	prometheus.MustRegister(countMessages)
+	prometheus.MustRegister(histBatchSize)
 	processStartTime = time.Now()
 }
 
@@ -111,7 +131,7 @@ type InternalDataplane struct {
 	iptablesNATTables    []*iptables.Table
 	iptablesRawTables    []*iptables.Table
 	iptablesFilterTables []*iptables.Table
-	ipSetRegistries      []*ipsets.Registry
+	ipSets               []*ipsets.IPSets
 
 	ipipManager *ipipManager
 
@@ -136,6 +156,8 @@ type InternalDataplane struct {
 	reschedTimer *time.Timer
 	reschedC     <-chan time.Time
 
+	applyThrottle *throttle.Throttle
+
 	config Config
 }
 
@@ -146,7 +168,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		ruleRenderer = rules.NewRenderer(config.RulesConfig)
 	}
 	dp := &InternalDataplane{
-		toDataplane:       make(chan interface{}, 100),
+		toDataplane:       make(chan interface{}, msgPeekLimit),
 		fromDataplane:     make(chan interface{}, 100),
 		ruleRenderer:      ruleRenderer,
 		interfacePrefixes: config.RulesConfig.WorkloadIfacePrefixes,
@@ -155,6 +177,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		ifaceUpdates:      make(chan *ifaceUpdate, 100),
 		ifaceAddrUpdates:  make(chan *ifaceAddrsUpdate, 100),
 		config:            config,
+		applyThrottle:     throttle.New(10),
 	}
 
 	dp.ifaceMonitor.Callback = dp.onIfaceStateChange
@@ -190,18 +213,18 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			RefreshInterval:       config.IptablesRefreshInterval,
 		})
 	ipSetsConfigV4 := config.RulesConfig.IPSetConfigV4
-	ipSetRegV4 := ipsets.NewRegistry(ipSetsConfigV4)
+	ipSetsV4 := ipsets.NewIPSets(ipSetsConfigV4)
 	dp.iptablesNATTables = append(dp.iptablesNATTables, natTableV4)
 	dp.iptablesRawTables = append(dp.iptablesRawTables, rawTableV4)
 	dp.iptablesFilterTables = append(dp.iptablesFilterTables, filterTableV4)
-	dp.ipSetRegistries = append(dp.ipSetRegistries, ipSetRegV4)
+	dp.ipSets = append(dp.ipSets, ipSetsV4)
 
 	routeTableV4 := routetable.New(config.RulesConfig.WorkloadIfacePrefixes, 4)
 	dp.routeTables = append(dp.routeTables, routeTableV4)
 
 	dp.endpointStatusCombiner = newEndpointStatusCombiner(dp.fromDataplane, config.IPv6Enabled)
 
-	dp.RegisterManager(newIPSetsManager(ipSetRegV4, config.MaxIPSetSize))
+	dp.RegisterManager(newIPSetsManager(ipSetsV4, config.MaxIPSetSize))
 	dp.RegisterManager(newPolicyManager(rawTableV4, filterTableV4, ruleRenderer, 4))
 	dp.RegisterManager(newEndpointManager(
 		rawTableV4,
@@ -212,10 +235,10 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		config.RulesConfig.WorkloadIfacePrefixes,
 		dp.endpointStatusCombiner.OnEndpointStatusUpdate))
 	dp.RegisterManager(newFloatingIPManager(natTableV4, ruleRenderer, 4))
-	dp.RegisterManager(newMasqManager(ipSetRegV4, natTableV4, ruleRenderer, config.MaxIPSetSize, 4))
+	dp.RegisterManager(newMasqManager(ipSetsV4, natTableV4, ruleRenderer, config.MaxIPSetSize, 4))
 	if config.RulesConfig.IPIPEnabled {
 		// Add a manger to keep the all-hosts IP set up to date.
-		dp.ipipManager = newIPIPManager(ipSetRegV4, config.MaxIPSetSize)
+		dp.ipipManager = newIPIPManager(ipSetsV4, config.MaxIPSetSize)
 		dp.RegisterManager(dp.ipipManager) // IPv4-only
 	}
 	if config.IPv6Enabled {
@@ -252,8 +275,8 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		)
 
 		ipSetsConfigV6 := config.RulesConfig.IPSetConfigV6
-		ipSetRegV6 := ipsets.NewRegistry(ipSetsConfigV6)
-		dp.ipSetRegistries = append(dp.ipSetRegistries, ipSetRegV6)
+		ipSetsV6 := ipsets.NewIPSets(ipSetsConfigV6)
+		dp.ipSets = append(dp.ipSets, ipSetsV6)
 		dp.iptablesNATTables = append(dp.iptablesNATTables, natTableV6)
 		dp.iptablesRawTables = append(dp.iptablesRawTables, rawTableV6)
 		dp.iptablesFilterTables = append(dp.iptablesFilterTables, filterTableV6)
@@ -261,7 +284,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		routeTableV6 := routetable.New(config.RulesConfig.WorkloadIfacePrefixes, 6)
 		dp.routeTables = append(dp.routeTables, routeTableV6)
 
-		dp.RegisterManager(newIPSetsManager(ipSetRegV6, config.MaxIPSetSize))
+		dp.RegisterManager(newIPSetsManager(ipSetsV6, config.MaxIPSetSize))
 		dp.RegisterManager(newPolicyManager(rawTableV6, filterTableV6, ruleRenderer, 6))
 		dp.RegisterManager(newEndpointManager(
 			rawTableV6,
@@ -272,7 +295,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			config.RulesConfig.WorkloadIfacePrefixes,
 			dp.endpointStatusCombiner.OnEndpointStatusUpdate))
 		dp.RegisterManager(newFloatingIPManager(natTableV6, ruleRenderer, 6))
-		dp.RegisterManager(newMasqManager(ipSetRegV6, natTableV6, ruleRenderer, config.MaxIPSetSize, 6))
+		dp.RegisterManager(newMasqManager(ipSetsV6, natTableV6, ruleRenderer, config.MaxIPSetSize, 6))
 	}
 
 	for _, t := range dp.iptablesNATTables {
@@ -304,6 +327,10 @@ func (d *InternalDataplane) RegisterManager(mgr Manager) {
 }
 
 func (d *InternalDataplane) Start() {
+	// Do our start-of-day configuration.
+	d.doStaticDataplaneConfig()
+
+	// Then, start the worker threads.
 	go d.loopUpdatingDataplane()
 	go d.loopReportingStatus()
 	go d.ifaceMonitor.MonitorInterfaces()
@@ -353,9 +380,10 @@ func (d *InternalDataplane) RecvMessage() (interface{}, error) {
 	return <-d.fromDataplane, nil
 }
 
-func (d *InternalDataplane) loopUpdatingDataplane() {
-	log.Info("Started internal iptables dataplane driver")
-
+// doStaticDataplaneConfig sets up the kernel and our static iptables  chains.  Should be called
+// once at start of day before starting the main loop.  The actual iptables programming is deferred
+// to the main loop.
+func (d *InternalDataplane) doStaticDataplaneConfig() {
 	// Check/configure global kernel parameters.
 	d.configureKernel()
 
@@ -411,6 +439,10 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 			Action: iptables.JumpAction{Target: rules.ChainNATOutput},
 		}})
 	}
+}
+
+func (d *InternalDataplane) loopUpdatingDataplane() {
+	log.Info("Started internal iptables dataplane driver loop")
 
 	// Retry any failed operations every 10s.
 	retryTicker := time.NewTicker(10 * time.Second)
@@ -423,23 +455,47 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 		refreshC = refreshTicker.C
 	}
 
+	// Fill the apply throttle leaky bucket.
+	throttleC := jitter.NewTicker(100*time.Millisecond, 10*time.Millisecond).C
+	beingThrottled := false
+
 	datastoreInSync := false
 	doneFirstApply := false
+
+	processMsgFromCalcGraph := func(msg interface{}) {
+		log.WithField("msg", msg).Infof("Received %T update from calculation graph", msg)
+		d.recordMsgStat(msg)
+		for _, mgr := range d.allManagers {
+			mgr.OnUpdate(msg)
+		}
+		switch msg.(type) {
+		case *proto.InSync:
+			log.WithField("timeSinceStart", time.Since(processStartTime)).Info(
+				"Datastore in sync, flushing the dataplane for the first time...")
+			datastoreInSync = true
+		}
+	}
+
 	for {
 		select {
 		case msg := <-d.toDataplane:
-			log.WithField("msg", msg).Info("Received update from calculation graph")
-			d.recordMsgStat(msg)
-			for _, mgr := range d.allManagers {
-				mgr.OnUpdate(msg)
-			}
-			switch msg.(type) {
-			case *proto.InSync:
-				log.WithField("timeSinceStart", time.Since(processStartTime)).Info(
-					"Datastore in sync, flushing the dataplane for the first time...")
-				datastoreInSync = true
+			// Process the message we received, then opportunistically process any other
+			// pending messages.
+			batchSize := 1
+			processMsgFromCalcGraph(msg)
+		msgLoop:
+			for i := 0; i < msgPeekLimit; i++ {
+				select {
+				case msg := <-d.toDataplane:
+					processMsgFromCalcGraph(msg)
+					batchSize++
+				default:
+					// Channel blocked so we must be caught up.
+					break msgLoop
+				}
 			}
 			d.dataplaneNeedsSync = true
+			histBatchSize.Observe(float64(batchSize))
 		case ifaceUpdate := <-d.ifaceUpdates:
 			log.WithField("msg", ifaceUpdate).Info("Received interface update")
 			for _, mgr := range d.allManagers {
@@ -464,23 +520,44 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 			d.dataplaneNeedsSync = true
 			// nil out the channel to record that the timer is now inactive.
 			d.reschedC = nil
+		case <-throttleC:
+			log.Debug("Throttle kick received")
+			d.applyThrottle.Refill()
 		case <-retryTicker.C:
 		}
 
 		if datastoreInSync && d.dataplaneNeedsSync {
-			log.Info("Applying updates to dataplane.")
-			applyStart := time.Now()
-			d.apply()
-			applyTime := time.Since(applyStart)
-			if applyTime > 0 {
-				// Avoid a negative interval in case the clock jumps.
-				histApplyTime.Observe(applyTime.Seconds())
+			// Dataplane is out-of-sync, check if we're throttled.
+			if d.applyThrottle.Admit() {
+				if beingThrottled && d.applyThrottle.WouldAdmit() {
+					log.Info("Dataplane updates no longer throttled")
+					beingThrottled = false
+				}
+				log.Info("Applying dataplane updates")
+				applyStart := time.Now()
+
+				// Actually apply the changes to the dataplane.
+				d.apply()
+
+				// Record stats.
+				applyTime := time.Since(applyStart)
+				if applyTime > 0 {
+					// Avoid a negative interval in case the clock jumps.
+					histApplyTime.Observe(applyTime.Seconds())
+				}
+
+				if d.dataplaneNeedsSync {
+					// Dataplane is still dirty, record an error.
+					countDataplaneSyncErrors.Inc()
+				}
+				log.WithField("msecToApply", applyTime.Seconds()*1000.0).Info(
+					"Finished applying updates to dataplane.")
+			} else {
+				if !beingThrottled {
+					log.Info("Dataplane updates throttled")
+					beingThrottled = true
+				}
 			}
-			if d.dataplaneNeedsSync {
-				countDataplaneSyncErrors.Inc()
-			}
-			log.WithField("msecToApply", applyTime.Seconds()*1000.0).Info(
-				"Finished applying updates to dataplane.")
 			if !doneFirstApply {
 				log.WithField("secsSinceStart", time.Since(processStartTime).Seconds()).Info(
 					"Completed first update to dataplane.")
@@ -574,19 +651,25 @@ func (d *InternalDataplane) apply() {
 		}
 	}
 
-	// Next, create/update IP sets.  We defer deletions of IP sets until after we update
-	// iptables.
-	for _, w := range d.ipSetRegistries {
-		w.ApplyUpdates()
-	}
-
 	if d.forceDataplaneRefresh {
+		// Refresh timer popped, ask the dataplane to resync as part of its update.
 		for _, r := range d.routeTables {
+			// Queue a resync on the next Apply().
+			r.QueueResync()
+		}
+		for _, r := range d.ipSets {
 			// Queue a resync on the next Apply().
 			r.QueueResync()
 		}
 		d.forceDataplaneRefresh = false
 	}
+
+	// Next, create/update IP sets.  We defer deletions of IP sets until after we update
+	// iptables.
+	for _, w := range d.ipSets {
+		w.ApplyUpdates()
+	}
+
 	// Update iptables, this should sever any references to now-unused IP sets.
 	var reschedDelay time.Duration
 	for _, t := range d.allIptablesTables {
@@ -606,19 +689,12 @@ func (d *InternalDataplane) apply() {
 	}
 
 	// Now clean up any left-over IP sets.
-	for _, w := range d.ipSetRegistries {
+	for _, w := range d.ipSets {
 		w.ApplyDeletions()
 	}
 
 	// And publish and status updates.
 	d.endpointStatusCombiner.Apply()
-
-	if d.cleanupPending {
-		for _, w := range d.ipSetRegistries {
-			w.AttemptCleanup()
-		}
-		d.cleanupPending = false
-	}
 
 	// Set up any needed rescheduling kick.
 	if d.reschedC != nil {
