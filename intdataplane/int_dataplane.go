@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -67,6 +68,16 @@ var (
 			1, 2, 5, 10, 20, 50,
 		},
 	})
+	summaryIfaceBatchSize = prometheus.NewSummary(prometheus.SummaryOpts{
+		Name: "felix_int_dataplane_iface_msg_batch_size",
+		Help: "Number of interface state messages processed in each batch. Higher " +
+			"values indicate we're doing more batching to try to keep up.",
+	})
+	summaryAddrBatchSize = prometheus.NewSummary(prometheus.SummaryOpts{
+		Name: "felix_int_dataplane_addr_msg_batch_size",
+		Help: "Number of interface address messages processed in each batch. Higher " +
+			"values indicate we're doing more batching to try to keep up.",
+	})
 
 	processStartTime time.Time
 )
@@ -76,6 +87,8 @@ func init() {
 	prometheus.MustRegister(histApplyTime)
 	prometheus.MustRegister(countMessages)
 	prometheus.MustRegister(histBatchSize)
+	prometheus.MustRegister(summaryIfaceBatchSize)
+	prometheus.MustRegister(summaryAddrBatchSize)
 	processStartTime = time.Now()
 }
 
@@ -93,6 +106,8 @@ type Config struct {
 	RulesConfig rules.Config
 
 	StatusReportingInterval time.Duration
+
+	PostInSyncCallback func()
 }
 
 // InternalDataplane implements an in-process Felix dataplane driver based on iptables
@@ -476,6 +491,23 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 		}
 	}
 
+	processIfaceUpdate := func(ifaceUpdate *ifaceUpdate) {
+		log.WithField("msg", ifaceUpdate).Info("Received interface update")
+		for _, mgr := range d.allManagers {
+			mgr.OnUpdate(ifaceUpdate)
+		}
+		for _, routeTable := range d.routeTables {
+			routeTable.OnIfaceStateChanged(ifaceUpdate.Name, ifaceUpdate.State)
+		}
+	}
+
+	processAddrsUpdate := func(ifaceAddrsUpdate *ifaceAddrsUpdate) {
+		log.WithField("msg", ifaceAddrsUpdate).Info("Received interface addresses update")
+		for _, mgr := range d.allManagers {
+			mgr.OnUpdate(ifaceAddrsUpdate)
+		}
+	}
+
 	for {
 		select {
 		case msg := <-d.toDataplane:
@@ -483,7 +515,7 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 			// pending messages.
 			batchSize := 1
 			processMsgFromCalcGraph(msg)
-		msgLoop:
+		msgLoop1:
 			for i := 0; i < msgPeekLimit; i++ {
 				select {
 				case msg := <-d.toDataplane:
@@ -491,25 +523,44 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 					batchSize++
 				default:
 					// Channel blocked so we must be caught up.
-					break msgLoop
+					break msgLoop1
 				}
 			}
 			d.dataplaneNeedsSync = true
 			histBatchSize.Observe(float64(batchSize))
 		case ifaceUpdate := <-d.ifaceUpdates:
-			log.WithField("msg", ifaceUpdate).Info("Received interface update")
-			for _, mgr := range d.allManagers {
-				mgr.OnUpdate(ifaceUpdate)
-			}
-			for _, routeTable := range d.routeTables {
-				routeTable.OnIfaceStateChanged(ifaceUpdate.Name, ifaceUpdate.State)
+			// Process the message we received, then opportunistically process any other
+			// pending messages.
+			batchSize := 1
+			processIfaceUpdate(ifaceUpdate)
+		msgLoop2:
+			for i := 0; i < msgPeekLimit; i++ {
+				select {
+				case ifaceUpdate := <-d.ifaceUpdates:
+					processIfaceUpdate(ifaceUpdate)
+					batchSize++
+				default:
+					// Channel blocked so we must be caught up.
+					break msgLoop2
+				}
 			}
 			d.dataplaneNeedsSync = true
+			summaryIfaceBatchSize.Observe(float64(batchSize))
 		case ifaceAddrsUpdate := <-d.ifaceAddrUpdates:
-			log.WithField("msg", ifaceAddrsUpdate).Info("Received interface addresses update")
-			for _, mgr := range d.allManagers {
-				mgr.OnUpdate(ifaceAddrsUpdate)
+			batchSize := 1
+			processAddrsUpdate(ifaceAddrsUpdate)
+		msgLoop3:
+			for i := 0; i < msgPeekLimit; i++ {
+				select {
+				case ifaceAddrsUpdate := <-d.ifaceAddrUpdates:
+					processAddrsUpdate(ifaceAddrsUpdate)
+					batchSize++
+				default:
+					// Channel blocked so we must be caught up.
+					break msgLoop3
+				}
 			}
+			summaryAddrBatchSize.Observe(float64(batchSize))
 			d.dataplaneNeedsSync = true
 		case <-refreshC:
 			log.Debug("Refreshing dataplane state")
@@ -562,6 +613,9 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 				log.WithField("secsSinceStart", time.Since(processStartTime).Seconds()).Info(
 					"Completed first update to dataplane.")
 				doneFirstApply = true
+				if d.config.PostInSyncCallback != nil {
+					d.config.PostInSyncCallback()
+				}
 			}
 		}
 	}
@@ -666,32 +720,64 @@ func (d *InternalDataplane) apply() {
 
 	// Next, create/update IP sets.  We defer deletions of IP sets until after we update
 	// iptables.
-	for _, w := range d.ipSets {
-		w.ApplyUpdates()
+	var ipSetsWG sync.WaitGroup
+	for _, ipSets := range d.ipSets {
+		ipSetsWG.Add(1)
+		go func(ipSets *ipsets.IPSets) {
+			ipSets.ApplyUpdates()
+			ipSetsWG.Done()
+		}(ipSets)
 	}
+
+	// Update the routing table in parallel with the other updates.  We'll wait for it to finish
+	// before we return.
+	var routesWG sync.WaitGroup
+	for _, r := range d.routeTables {
+		routesWG.Add(1)
+		go func(r *routetable.RouteTable) {
+			err := r.Apply()
+			if err != nil {
+				log.Warn("Failed to synchronize routing table, will retry...")
+				d.dataplaneNeedsSync = true
+			}
+			routesWG.Done()
+		}(r)
+	}
+
+	// Wait for the IP sets update to finish.  We can't update iptables until it has.
+	ipSetsWG.Wait()
 
 	// Update iptables, this should sever any references to now-unused IP sets.
+	var reschedDelayMutex sync.Mutex
 	var reschedDelay time.Duration
+	var iptablesWG sync.WaitGroup
 	for _, t := range d.allIptablesTables {
-		tableReschedAfter := t.Apply()
-		if tableReschedAfter != 0 && (reschedDelay == 0 || tableReschedAfter < reschedDelay) {
-			reschedDelay = tableReschedAfter
-		}
-	}
+		iptablesWG.Add(1)
+		go func(t *iptables.Table) {
+			tableReschedAfter := t.Apply()
 
-	// Update the routing table.
-	for _, r := range d.routeTables {
-		err := r.Apply()
-		if err != nil {
-			log.Warn("Failed to synchronize routing table, will retry...")
-			d.dataplaneNeedsSync = true
-		}
+			reschedDelayMutex.Lock()
+			defer reschedDelayMutex.Unlock()
+			if tableReschedAfter != 0 && (reschedDelay == 0 || tableReschedAfter < reschedDelay) {
+				reschedDelay = tableReschedAfter
+			}
+			iptablesWG.Done()
+		}(t)
 	}
+	iptablesWG.Wait()
 
 	// Now clean up any left-over IP sets.
-	for _, w := range d.ipSets {
-		w.ApplyDeletions()
+	for _, ipSets := range d.ipSets {
+		ipSetsWG.Add(1)
+		go func(s *ipsets.IPSets) {
+			s.ApplyDeletions()
+			ipSetsWG.Done()
+		}(ipSets)
 	}
+	ipSetsWG.Wait()
+
+	// Wait for the route updates to finish.
+	routesWG.Wait()
 
 	// And publish and status updates.
 	d.endpointStatusCombiner.Apply()
