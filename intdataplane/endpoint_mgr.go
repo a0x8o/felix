@@ -66,11 +66,11 @@ type endpointManager struct {
 	pendingIfaceUpdates map[string]ifacemonitor.State
 
 	// Active state, updated in CompleteDeferredWork.
-	activeWlEndpoints     map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint
-	activeWlIfaceNameToID map[string]proto.WorkloadEndpointID
-	activeUpIfaces        set.Set
-	activeWlIDToChains    map[proto.WorkloadEndpointID][]*iptables.Chain
-	activeDispatchChains  []*iptables.Chain
+	activeWlEndpoints      map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint
+	activeWlIfaceNameToID  map[string]proto.WorkloadEndpointID
+	activeUpIfaces         set.Set
+	activeWlIDToChains     map[proto.WorkloadEndpointID][]*iptables.Chain
+	activeWlDispatchChains map[string]*iptables.Chain
 
 	// wlIfaceNamesToReconfigure contains names of workload interfaces that need to have
 	// their configuration (sysctls etc.) refreshed.
@@ -91,12 +91,14 @@ type endpointManager struct {
 	activeHostIfaceToRawChains  map[string][]*iptables.Chain
 	activeHostIfaceToFiltChains map[string][]*iptables.Chain
 	// Dispatch chains that we've programmed for host endpoints.
-	activeHostRawDispatchChains  []*iptables.Chain
-	activeHostFiltDispatchChains []*iptables.Chain
+	activeHostRawDispatchChains  map[string]*iptables.Chain
+	activeHostFiltDispatchChains map[string]*iptables.Chain
 	// activeHostEpIDToIfaceNames records which interfaces we resolved each host endpoint to.
 	activeHostEpIDToIfaceNames map[proto.HostEndpointID][]string
 	// activeIfaceNameToHostEpID records which endpoint we resolved each host interface to.
 	activeIfaceNameToHostEpID map[string]proto.HostEndpointID
+
+	needToCheckDispatchChains bool
 
 	// Callbacks
 	OnEndpointStatusUpdate EndpointStatusUpdateCallback
@@ -171,6 +173,13 @@ func newEndpointManagerWithShims(
 
 		activeHostIfaceToRawChains:  map[string][]*iptables.Chain{},
 		activeHostIfaceToFiltChains: map[string][]*iptables.Chain{},
+
+		// Caches of the current dispatch chains indexed by chain name.  We use these to
+		// calculate deltas when we need to update the chains.
+		activeWlDispatchChains:       map[string]*iptables.Chain{},
+		activeHostFiltDispatchChains: map[string]*iptables.Chain{},
+		activeHostRawDispatchChains:  map[string]*iptables.Chain{},
+		needToCheckDispatchChains:    true, // Need to do start-of-day update.
 
 		OnEndpointStatusUpdate: onWorkloadEndpointStatusUpdate,
 	}
@@ -358,9 +367,10 @@ func (m *endpointManager) calculateHostEndpointStatus(id proto.HostEndpointID) (
 }
 
 func (m *endpointManager) resolveWorkloadEndpoints() {
-	// Optimisation, only recalculate the dispatch chains if we've never done so or if the
-	// workloads have changed in some way.
-	needToCheckDispatchChains := m.activeDispatchChains == nil || len(m.pendingWlEpUpdates) > 0
+	if len(m.pendingWlEpUpdates) > 0 {
+		// We're about to make endpoint updates, make sure we recheck the dispatch chains.
+		m.needToCheckDispatchChains = true
+	}
 
 	// Update any dirty endpoints.
 	for id, workload := range m.pendingWlEpUpdates {
@@ -459,15 +469,11 @@ func (m *endpointManager) resolveWorkloadEndpoints() {
 		m.epIDsToUpdateStatus.Add(id)
 	}
 
-	if needToCheckDispatchChains {
+	if m.needToCheckDispatchChains {
 		// Rewrite the dispatch chains if they've changed.
 		newDispatchChains := m.ruleRenderer.WorkloadDispatchChains(m.activeWlEndpoints)
-		if !reflect.DeepEqual(newDispatchChains, m.activeDispatchChains) {
-			log.Info("Workloads changed, updating dispatch chains.")
-			m.filterTable.RemoveChains(m.activeDispatchChains)
-			m.filterTable.UpdateChains(newDispatchChains)
-			m.activeDispatchChains = newDispatchChains
-		}
+		m.updateDispatchChains(m.activeWlDispatchChains, newDispatchChains, m.filterTable)
+		m.needToCheckDispatchChains = false
 	}
 
 	m.wlIfaceNamesToReconfigure.Iter(func(item interface{}) error {
@@ -664,22 +670,38 @@ func (m *endpointManager) resolveHostEndpoints() {
 	// Rewrite the filter dispatch chains if they've changed.
 	log.WithField("resolvedHostEpIds", newIfaceNameToHostEpID).Debug("Rewrite dispatch chains?")
 	newFiltDispatchChains := m.ruleRenderer.HostDispatchChains(newIfaceNameToHostEpID)
-	if !reflect.DeepEqual(newFiltDispatchChains, m.activeHostFiltDispatchChains) {
-		log.Info("HostEps changed, updating filter dispatch chains.")
-		m.filterTable.RemoveChains(m.activeHostFiltDispatchChains)
-		m.filterTable.UpdateChains(newFiltDispatchChains)
-		m.activeHostFiltDispatchChains = newFiltDispatchChains
-	}
+	m.updateDispatchChains(m.activeHostFiltDispatchChains, newFiltDispatchChains, m.filterTable)
 
 	// Rewrite the raw dispatch chains if they've changed.
 	newRawDispatchChains := m.ruleRenderer.HostDispatchChains(newUntrackedIfaceNameToHostEpID)
-	if !reflect.DeepEqual(newRawDispatchChains, m.activeHostRawDispatchChains) {
-		log.Info("HostEps changed, updating raw dispatch chains.")
-		m.rawTable.RemoveChains(m.activeHostRawDispatchChains)
-		m.rawTable.UpdateChains(newRawDispatchChains)
-		m.activeHostRawDispatchChains = newRawDispatchChains
-	}
+	m.updateDispatchChains(m.activeHostRawDispatchChains, newRawDispatchChains, m.rawTable)
 	log.Debug("Done resolving host endpoints.")
+}
+
+// updateDispatchChains updates one of the sets of dispatch chains.  It sends the changes to the
+// given iptables.Table and records the updates in the activeChains map.
+//
+// Calculating the minimum update prevents log spam and reduces the work needed in the Table.
+func (m *endpointManager) updateDispatchChains(
+	activeChains map[string]*iptables.Chain,
+	newChains []*iptables.Chain,
+	table iptablesTable,
+) {
+	seenChains := set.New()
+	for _, newChain := range newChains {
+		seenChains.Add(newChain.Name)
+		oldChain := activeChains[newChain.Name]
+		if !reflect.DeepEqual(newChain, oldChain) {
+			table.UpdateChain(newChain)
+			activeChains[newChain.Name] = newChain
+		}
+	}
+	for name := range activeChains {
+		if !seenChains.Contains(name) {
+			table.RemoveChainByName(name)
+			delete(activeChains, name)
+		}
+	}
 }
 
 func (m *endpointManager) configureInterface(name string) error {
@@ -691,24 +713,62 @@ func (m *endpointManager) configureInterface(name string) error {
 	log.WithField("ifaceName", name).Info(
 		"Applying /proc/sys configuration to interface.")
 	if m.ipVersion == 4 {
+		// Enable strict reverse-path filtering.  This prevents a workload from spoofing its
+		// IP address.  Non-privileged containers have additional anti-spoofing protection
+		// but VM workloads, for example, can easily spoof their IP.
 		err := m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", name), "1")
 		if err != nil {
 			return err
 		}
+		// Enable routing to localhost.  This is required to allow for NAT to the local
+		// host.
 		err = m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/route_localnet", name), "1")
 		if err != nil {
 			return err
 		}
+		// Enable proxy ARP, this makes the host respond to all ARP requests with its own
+		// MAC.  This has a couple of advantages:
+		//
+		// - In OpenStack, we're forced to configure the guest's networking using DHCP.
+		//   Since DHCP requires a subnet and gateway, representing the Calico network
+		//   in the natural way would lose a lot of IP addresses.  For IPv4, we'd have to
+		//   advertise a distinct /30 to each guest, which would use up 4 IPs per guest.
+		//   Using proxy ARP, we can advertise the whole pool to each guest as its subnet
+		//   but have the host respond to all ARP requests and route all the traffic whether
+		//   it is on or off subnet.
+		//
+		// - For containers, we install explicit routes into the containers network
+		//   namespace and we use a link-local address for the gateway.  Turing on proxy ARP
+		//   means that we don't need to assign the link local address explicitly to each
+		//   host side of the veth, which is one fewer thing to maintain and one fewer
+		//   thing we may clash over.
 		err = m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", name), "1")
 		if err != nil {
 			return err
 		}
+		// Normally, the kernel has a delay before responding to proxy ARP but we know
+		// that's not needed in a Calico network so we disable it.
 		err = m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/neigh/%s/proxy_delay", name), "0")
 		if err != nil {
 			return err
 		}
+		// Enable IP forwarding of packets coming _from_ this interface.  For packets to
+		// be forwarded in both directions we need this flag to be set on the fabric-facing
+		// interface too (or for the global default to be set).
+		err = m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/forwarding", name), "1")
+		if err != nil {
+			return err
+		}
 	} else {
+		// Enable proxy NDP, similarly to proxy ARP, described above.
 		err := m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/proxy_ndp", name), "1")
+		if err != nil {
+			return err
+		}
+		// Enable IP forwarding of packets coming _from_ this interface.  For packets to
+		// be forwarded in both directions we need this flag to be set on the fabric-facing
+		// interface too (or for the global default to be set).
+		err = m.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/forwarding", name), "1")
 		if err != nil {
 			return err
 		}

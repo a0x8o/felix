@@ -15,6 +15,7 @@
 package intdataplane
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"reflect"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/gavv/monotime"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/projectcalico/felix/ifacemonitor"
@@ -53,20 +55,14 @@ var (
 		Name: "felix_int_dataplane_messages",
 		Help: "Number dataplane messages by type.",
 	}, []string{"type"})
-	histApplyTime = prometheus.NewHistogram(prometheus.HistogramOpts{
+	summaryApplyTime = prometheus.NewSummary(prometheus.SummaryOpts{
 		Name: "felix_int_dataplane_apply_time_seconds",
 		Help: "Time in seconds that it took to apply a dataplane update.",
-		Buckets: []float64{
-			0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
-		},
 	})
-	histBatchSize = prometheus.NewHistogram(prometheus.HistogramOpts{
+	summaryBatchSize = prometheus.NewSummary(prometheus.SummaryOpts{
 		Name: "felix_int_dataplane_msg_batch_size",
 		Help: "Number of messages processed in each batch. Higher values indicate we're " +
 			"doing more batching to try to keep up.",
-		Buckets: []float64{
-			1, 2, 5, 10, 20, 50,
-		},
 	})
 	summaryIfaceBatchSize = prometheus.NewSummary(prometheus.SummaryOpts{
 		Name: "felix_int_dataplane_iface_msg_batch_size",
@@ -79,17 +75,17 @@ var (
 			"values indicate we're doing more batching to try to keep up.",
 	})
 
-	processStartTime time.Time
+	processStartTime time.Duration
 )
 
 func init() {
 	prometheus.MustRegister(countDataplaneSyncErrors)
-	prometheus.MustRegister(histApplyTime)
+	prometheus.MustRegister(summaryApplyTime)
 	prometheus.MustRegister(countMessages)
-	prometheus.MustRegister(histBatchSize)
+	prometheus.MustRegister(summaryBatchSize)
 	prometheus.MustRegister(summaryIfaceBatchSize)
 	prometheus.MustRegister(summaryAddrBatchSize)
-	processStartTime = time.Now()
+	processStartTime = monotime.Now()
 }
 
 type Config struct {
@@ -478,14 +474,15 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 	doneFirstApply := false
 
 	processMsgFromCalcGraph := func(msg interface{}) {
-		log.WithField("msg", msg).Infof("Received %T update from calculation graph", msg)
+		log.WithField("msg", msgStringer{msg: msg}).Infof(
+			"Received %T update from calculation graph", msg)
 		d.recordMsgStat(msg)
 		for _, mgr := range d.allManagers {
 			mgr.OnUpdate(msg)
 		}
 		switch msg.(type) {
 		case *proto.InSync:
-			log.WithField("timeSinceStart", time.Since(processStartTime)).Info(
+			log.WithField("timeSinceStart", monotime.Since(processStartTime)).Info(
 				"Datastore in sync, flushing the dataplane for the first time...")
 			datastoreInSync = true
 		}
@@ -527,7 +524,7 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 				}
 			}
 			d.dataplaneNeedsSync = true
-			histBatchSize.Observe(float64(batchSize))
+			summaryBatchSize.Observe(float64(batchSize))
 		case ifaceUpdate := <-d.ifaceUpdates:
 			// Process the message we received, then opportunistically process any other
 			// pending messages.
@@ -585,17 +582,14 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 					beingThrottled = false
 				}
 				log.Info("Applying dataplane updates")
-				applyStart := time.Now()
+				applyStart := monotime.Now()
 
 				// Actually apply the changes to the dataplane.
 				d.apply()
 
 				// Record stats.
-				applyTime := time.Since(applyStart)
-				if applyTime > 0 {
-					// Avoid a negative interval in case the clock jumps.
-					histApplyTime.Observe(applyTime.Seconds())
-				}
+				applyTime := monotime.Since(applyStart)
+				summaryApplyTime.Observe(applyTime.Seconds())
 
 				if d.dataplaneNeedsSync {
 					// Dataplane is still dirty, record an error.
@@ -610,8 +604,9 @@ func (d *InternalDataplane) loopUpdatingDataplane() {
 				}
 			}
 			if !doneFirstApply {
-				log.WithField("secsSinceStart", time.Since(processStartTime).Seconds()).Info(
-					"Completed first update to dataplane.")
+				log.WithField(
+					"secsSinceStart", monotime.Since(processStartTime).Seconds(),
+				).Info("Completed first update to dataplane.")
 				doneFirstApply = true
 				if d.config.PostInSyncCallback != nil {
 					d.config.PostInSyncCallback()
@@ -814,15 +809,12 @@ func (d *InternalDataplane) loopReportingStatus() {
 		log.Info("Process status reports disabled")
 		return
 	}
-	start := time.Now()
 	// Wait before first report so that we don't check in if we're in a tight cyclic restart.
 	time.Sleep(10 * time.Second)
 	for {
-		now := time.Now()
-		uptimeNanos := float64(now.Sub(start))
-		uptimeSecs := uptimeNanos / 1000000000
+		uptimeSecs := monotime.Since(processStartTime).Seconds()
 		d.fromDataplane <- &proto.ProcessStatusUpdate{
-			IsoTimestamp: now.UTC().Format(time.RFC3339),
+			IsoTimestamp: time.Now().UTC().Format(time.RFC3339),
 			Uptime:       uptimeSecs,
 		}
 		time.Sleep(d.config.StatusReportingInterval)
@@ -835,4 +827,40 @@ type iptablesTable interface {
 	UpdateChains([]*iptables.Chain)
 	RemoveChains([]*iptables.Chain)
 	RemoveChainByName(name string)
+}
+
+// msgStringer wraps an API message to customise how we stringify it.  For example, it truncates
+// the lists of members in the (potentially very large) IPSetsUpdate messages.
+type msgStringer struct {
+	msg interface{}
+}
+
+func (m msgStringer) String() string {
+	if log.GetLevel() < log.DebugLevel && m.msg != nil {
+		const truncateAt = 10
+		switch msg := m.msg.(type) {
+		case *proto.IPSetUpdate:
+			if len(msg.Members) < truncateAt {
+				return fmt.Sprintf("%v", msg)
+			}
+			return fmt.Sprintf("id:%#v members(%d):%#v(truncated)",
+				msg.Id, len(msg.Members), msg.Members[:truncateAt])
+		case *proto.IPSetDeltaUpdate:
+			if len(msg.AddedMembers) < truncateAt && len(msg.RemovedMembers) < truncateAt {
+				return fmt.Sprintf("%v", msg)
+			}
+			addedNum := truncateAt
+			removedNum := truncateAt
+			if len(msg.AddedMembers) < addedNum {
+				addedNum = len(msg.AddedMembers)
+			}
+			if len(msg.RemovedMembers) < removedNum {
+				removedNum = len(msg.RemovedMembers)
+			}
+			return fmt.Sprintf("id:%#v addedMembers(%d):%#v(truncated) removedMembers(%d):%#v(truncated)",
+				msg.Id, len(msg.AddedMembers), msg.AddedMembers[:addedNum],
+				len(msg.RemovedMembers), msg.RemovedMembers[:removedNum])
+		}
+	}
+	return fmt.Sprintf("%v", m.msg)
 }
