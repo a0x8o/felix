@@ -70,12 +70,12 @@ var _ = Describe("RouteTable", func() {
 	})
 
 	Describe("with some interfaces", func() {
-		var cali1, cali2, cali3, eth0 *mockLink
+		var cali1, cali3, eth0 *mockLink
 		var gatewayRoute, cali1Route, cali1Route2, cali3Route netlink.Route
 		BeforeEach(func() {
 			eth0 = dataplane.addIface(0, "eth0", true, true)
 			cali1 = dataplane.addIface(1, "cali1", true, true)
-			cali2 = dataplane.addIface(2, "cali2", true, true)
+			dataplane.addIface(2, "cali2", true, true)
 			cali3 = dataplane.addIface(3, "cali3", true, true)
 			cali1Route = netlink.Route{
 				LinkIndex: cali1.attrs.Index,
@@ -139,6 +139,14 @@ var _ = Describe("RouteTable", func() {
 							log.Info("Apply returned no error, breaking out of loop")
 							break
 						}
+					}
+					if failFlags == failNextLinkByNameNotFound {
+						// Special case: a "not found" error doesn't get
+						// rechecked straight away because it's expected
+						// so we have to give the RouteTable a nudge.
+						rt.QueueResync()
+						err := rt.Apply()
+						Expect(err).ToNot(HaveOccurred())
 					}
 				})
 				It("should have consumed all failures", func() {
@@ -298,6 +306,13 @@ var _ = Describe("RouteTable", func() {
 	})
 })
 
+var _ = Describe("Tests to verify netlink interface", func() {
+	It("Should give expected error for missing interface", func() {
+		_, err := netlink.LinkByName("dsfhjakdhfjk")
+		Expect(err.Error()).To(ContainSubstring("not found"))
+	})
+})
+
 func mustParseCIDR(cidr string) *net.IPNet {
 	_, c, err := net.ParseCIDR(cidr)
 	Expect(err).NotTo(HaveOccurred())
@@ -309,6 +324,7 @@ type failFlags uint32
 const (
 	failNextLinkList failFlags = 1 << iota
 	failNextLinkByName
+	failNextLinkByNameNotFound
 	failNextRouteList
 	failNextRouteAdd
 	failNextRouteDel
@@ -320,6 +336,7 @@ var failureScenarios = []failFlags{
 	failNone,
 	failNextLinkList,
 	failNextLinkByName,
+	failNextLinkByNameNotFound,
 	failNextRouteList,
 	failNextRouteAdd,
 	failNextRouteDel,
@@ -333,6 +350,9 @@ func (f failFlags) String() string {
 	}
 	if f&failNextLinkByName != 0 {
 		parts = append(parts, "failNextLinkByName")
+	}
+	if f&failNextLinkByNameNotFound != 0 {
+		parts = append(parts, "failNextLinkByNameNotFound")
 	}
 	if f&failNextRouteList != 0 {
 		parts = append(parts, "failNextRouteList")
@@ -404,6 +424,9 @@ func (d *mockDataplane) LinkList() ([]netlink.Link, error) {
 }
 
 func (d *mockDataplane) LinkByName(name string) (netlink.Link, error) {
+	if d.shouldFail(failNextLinkByNameNotFound) {
+		return nil, notFound
+	}
 	if d.shouldFail(failNextLinkByName) {
 		return nil, simulatedError
 	}

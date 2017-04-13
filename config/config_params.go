@@ -137,17 +137,20 @@ type Config struct {
 
 	IptablesMarkMask uint32 `config:"mark-bitmask;0xff000000;non-zero,die-on-fail"`
 
+	DisableConntrackInvalidCheck bool `config:"bool;false"`
+
 	PrometheusMetricsEnabled bool `config:"bool;false"`
 	PrometheusMetricsPort    int  `config:"int(0,65535);9091"`
 
-	FailsafeInboundHostPorts  []uint16 `config:"port-list;22;die-on-fail"`
-	FailsafeOutboundHostPorts []uint16 `config:"port-list;2379,2380,4001,7001;die-on-fail"`
+	FailsafeInboundHostPorts  []ProtoPort `config:"port-list;tcp:22,udp:68;die-on-fail"`
+	FailsafeOutboundHostPorts []ProtoPort `config:"port-list;tcp:2379,tcp:2380,tcp:4001,tcp:7001,udp:53,udp:67;die-on-fail"`
 
 	UsageReportingEnabled bool   `config:"bool;true"`
 	ClusterGUID           string `config:"string;baddecaf"`
 	ClusterType           string `config:"string;"`
 
-	DebugMemoryProfilePath string `config:"file;;"`
+	DebugMemoryProfilePath  string `config:"file;;"`
+	DebugDisableLogDropping bool   `config:"bool;false"`
 
 	// State tracking.
 
@@ -157,6 +160,11 @@ type Config struct {
 	Err               error
 
 	numIptablesBitsAllocated int
+}
+
+type ProtoPort struct {
+	Protocol string
+	Port     uint16
 }
 
 // Load parses and merges the rawData from one particular source into this config object.
