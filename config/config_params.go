@@ -28,7 +28,6 @@ import (
 	log "github.com/Sirupsen/logrus"
 
 	"github.com/projectcalico/libcalico-go/lib/api"
-	"github.com/projectcalico/libcalico-go/lib/backend/etcd"
 	"github.com/projectcalico/libcalico-go/lib/client"
 )
 
@@ -102,6 +101,10 @@ type Config struct {
 	EtcdCertFile  string   `config:"file(must-exist);;local"`
 	EtcdCaFile    string   `config:"file(must-exist);;local"`
 	EtcdEndpoints []string `config:"endpoint-list;;local"`
+
+	TyphaAddr           string `config:"authority;;"`
+	TyphaK8sServiceName string `config:"string;"`
+	TyphaK8sNamespace   string `config:"string;kube-system;non-zero"`
 
 	Ipv6Support    bool `config:"bool;true"`
 	IgnoreLooseRPF bool `config:"bool;false"`
@@ -344,7 +347,7 @@ func (config *Config) DatastoreConfig() api.CalicoAPIConfig {
 		} else {
 			etcdEndpoints = strings.Join(config.EtcdEndpoints, ",")
 		}
-		etcdCfg := etcd.EtcdConfig{
+		etcdCfg := api.EtcdConfig{
 			EtcdEndpoints:  etcdEndpoints,
 			EtcdKeyFile:    config.EtcdKeyFile,
 			EtcdCertFile:   config.EtcdCertFile,
