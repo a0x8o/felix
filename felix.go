@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -35,7 +36,6 @@ import (
 	"github.com/docopt/docopt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -276,14 +276,14 @@ configRetry:
 
 				DisableConntrackInvalid: configParams.DisableConntrackInvalidCheck,
 			},
-			IPIPMTU:                 configParams.IpInIpMtu,
-			IptablesRefreshInterval: time.Duration(configParams.IptablesRefreshInterval) * time.Second,
-			IptablesInsertMode:      configParams.ChainInsertMode,
-			MaxIPSetSize:            configParams.MaxIpsetSize,
-			IgnoreLooseRPF:          configParams.IgnoreLooseRPF,
-			IPv6Enabled:             configParams.Ipv6Support,
-			StatusReportingInterval: time.Duration(configParams.ReportingIntervalSecs) *
-				time.Second,
+			IPIPMTU:                        configParams.IpInIpMtu,
+			IptablesRefreshInterval:        configParams.IptablesRefreshInterval,
+			IptablesPostWriteCheckInterval: configParams.IptablesPostWriteCheckIntervalSecs,
+			IptablesInsertMode:             configParams.ChainInsertMode,
+			MaxIPSetSize:                   configParams.MaxIpsetSize,
+			IgnoreLooseRPF:                 configParams.IgnoreLooseRPF,
+			IPv6Enabled:                    configParams.Ipv6Support,
+			StatusReportingInterval:        configParams.ReportingIntervalSecs,
 
 			PostInSyncCallback: func() { dumpHeapMemoryProfile(configParams) },
 		}
@@ -313,15 +313,15 @@ configRetry:
 	// Syncer -chan-> Validator -chan-> Calc graph -chan->   dataplane
 	//        KVPair            KVPair             protobufs
 
-	// Get a Syncer from the datastore, which will feed the calculation
-	// graph with updates, bringing Felix into sync..
-	syncerToValidator := calc.NewSyncerCallbacksDecoupler()
-
+	// Get a Syncer from the datastore, or a connection to our remote sync daemon, Typha,
+	// which will feed the calculation graph with updates, bringing Felix into sync.
 	var syncer Startable
+	var typhaConnection *syncclient.SyncerClient
+	syncerToValidator := calc.NewSyncerCallbacksDecoupler()
 	if typhaAddr != "" {
-		// Use a remote Syncer, in the Typha server.
+		// Use a remote Syncer, via the Typha server.
 		log.WithField("addr", typhaAddr).Info("Connecting to Typha.")
-		syncer = syncclient.New(
+		typhaConnection = syncclient.New(
 			typhaAddr,
 			buildinfo.GitVersion,
 			configParams.FelixHostname,
@@ -395,14 +395,26 @@ configRetry:
 	validator := calc.NewValidationFilter(asyncCalcGraph)
 
 	// Start the background processing threads.
-	log.Infof("Starting the datastore Syncer/processing graph")
-	syncer.Start()
+	if syncer != nil {
+		log.Infof("Starting the datastore Syncer")
+		syncer.Start()
+	} else {
+		log.Infof("Starting the Typha connection")
+		err := typhaConnection.Start(context.Background())
+		if err != nil {
+			log.WithError(err).Fatal("Failed to connect to Typha")
+		}
+		go func() {
+			typhaConnection.Finished.Wait()
+			failureReportChan <- "Connection to Typha failed"
+		}()
+	}
 	go syncerToValidator.SendTo(validator)
 	asyncCalcGraph.Start()
-	log.Infof("Started the datastore Syncer/processing graph")
+	log.Infof("Started the processing graph")
 	var stopSignalChans []chan<- bool
 	if configParams.EndpointReportingEnabled {
-		delay := configParams.EndpointReportingDelay()
+		delay := configParams.EndpointReportingDelaySecs
 		log.WithField("delay", delay).Info(
 			"Endpoint status reporting enabled, starting status reporter")
 		dpConnector.statusReporter = statusrep.NewEndpointStatusReporter(
@@ -732,7 +744,7 @@ func (fc *DataplaneConnector) handleProcessStatusUpdate(msg *proto.ProcessStatus
 	kv := model.KVPair{
 		Key:   model.ActiveStatusReportKey{Hostname: fc.config.FelixHostname},
 		Value: &statusReport,
-		TTL:   time.Duration(fc.config.ReportingTTLSecs) * time.Second,
+		TTL:   fc.config.ReportingTTLSecs,
 	}
 	_, err := fc.datastore.Apply(&kv)
 	if err != nil {

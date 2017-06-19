@@ -1,5 +1,5 @@
-hash: 9ba5bbe02b8beeffb9702fe08a9b9a0dacfaac9e3cf2a74e3d4be9acc0f9e1f3
-updated: 2017-06-07T15:44:29.13966987Z
+hash: aafcc9f46c3998881e27db8c9ace72c1fbb76c6d10a90976ca84945f2939be9d
+updated: 2017-06-16T10:55:07.180304087Z
 imports:
 - name: github.com/beorn7/perks
   version: 4c0e84591b9aa9e6dcfdf3e020114cd81f89d5f9
@@ -69,7 +69,7 @@ imports:
 - name: github.com/golang/glog
   version: 44145f04b68cf362d9c4df2182967c2275eaefed
 - name: github.com/golang/protobuf
-  version: 5a0f697c9ed9d68fef0116532c6e05cfeae00e55
+  version: e325f446bebc2998605911c0a2650d9920361d4a
   subpackages:
   - proto
 - name: github.com/google/gofuzz
@@ -126,7 +126,7 @@ imports:
 - name: github.com/projectcalico/go-yaml-wrapper
   version: 598e54215bee41a19677faa4f0c32acd2a87eb56
 - name: github.com/projectcalico/libcalico-go
-  version: 73241603bc62d6e7a94582f06327ac661bb6ecdc
+  version: e40a090d7d025f7ab60f7a5e5bc362f875116754
   subpackages:
   - lib
   - lib/api
@@ -154,7 +154,7 @@ imports:
   - lib/testutils
   - lib/validator
 - name: github.com/projectcalico/typha
-  version: f898a49820203008748425069e3f38199593fe2e
+  version: 1259fa7110789a4f5b08da8406f17a3f2dbd06a2
   subpackages:
   - pkg/syncclient
   - pkg/syncproto
@@ -169,13 +169,13 @@ imports:
   subpackages:
   - go
 - name: github.com/prometheus/common
-  version: 13ba4ddd0caa9c28ca7b7bffe1dfa9ed8d5ef207
+  version: 94eb3fe3a55f1b5d12d335b27a4f6e37cd73ed7e
   subpackages:
   - expfmt
   - internal/bitbucket.org/ww/goautoneg
   - model
 - name: github.com/prometheus/procfs
-  version: fdb70a78745a8df006f953b8bab85597d96b2e0e
+  version: a3bfc74126ea9e45ee5d5c6f7fc86191b7d488fb
   subpackages:
   - xfs
 - name: github.com/PuerkitoBio/purell
@@ -193,7 +193,7 @@ imports:
   subpackages:
   - codec
 - name: github.com/vishvananda/netlink
-  version: bd6d5de5ccef2d66b0a26177928d0d8895d7f969
+  version: 4e28683688429fdf8413cc610d59fb1841986300
   subpackages:
   - nl
 - name: github.com/vishvananda/netns
@@ -211,7 +211,7 @@ imports:
   - idna
   - lex/httplex
 - name: golang.org/x/sys
-  version: b9e8d468b01f806830d387bd9a1fe96dc68129d1
+  version: fb4cac33e3196ff7f507ab9b2d2a44b0142f5b5a
   subpackages:
   - unix
 - name: golang.org/x/text
