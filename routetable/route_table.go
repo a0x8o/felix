@@ -20,18 +20,20 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
-
-	log "github.com/Sirupsen/logrus"
-	"github.com/vishvananda/netlink"
+	"time"
 
 	"github.com/gavv/monotime"
 	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 
 	"github.com/projectcalico/felix/conntrack"
 	"github.com/projectcalico/felix/ifacemonitor"
 	"github.com/projectcalico/felix/ip"
-	"github.com/projectcalico/felix/set"
+	"github.com/projectcalico/libcalico-go/lib/set"
 )
+
+const cleanupGracePeriod = 10 * time.Second
 
 var (
 	GetFailed       = errors.New("netlink get operation failed")
@@ -39,6 +41,7 @@ var (
 	UpdateFailed    = errors.New("netlink update operation failed")
 	IfaceNotPresent = errors.New("interface not present")
 	IfaceDown       = errors.New("interface down")
+	IfaceGrace      = errors.New("interface in cleanup grace period")
 
 	ipV6LinkLocalCIDR = ip.MustParseCIDR("fe80::/64")
 
@@ -73,21 +76,26 @@ type RouteTable struct {
 	ifacePrefixRegexp *regexp.Regexp
 
 	ifaceNameToTargets        map[string][]Target
+	ifaceNameToFirstSeen      map[string]time.Time
 	pendingIfaceNameToTargets map[string][]Target
+
+	pendingConntrackCleanups map[ip.Addr]chan struct{}
 
 	inSync bool
 
 	// dataplane is our shim for the netlink/arp interface.  In production, it maps directly
 	// through to calls to the netlink package and the arp command.
 	dataplane dataplaneIface
+	// time is our shim for the time package, allowing it to be mocked for UT.
+	time timeIface
 }
 
 func New(interfacePrefixes []string, ipVersion uint8) *RouteTable {
-	return NewWithShims(interfacePrefixes, ipVersion, realDataplane{conntrack: conntrack.New()})
+	return NewWithShims(interfacePrefixes, ipVersion, realDataplane{conntrack: conntrack.New()}, realTime{})
 }
 
-// NewWithShims is a test constructor, which allows netlink to be replaced by a shim.
-func NewWithShims(interfacePrefixes []string, ipVersion uint8, nl dataplaneIface) *RouteTable {
+// NewWithShims is a test constructor, which allows netlink, arp and time to be replaced by shims.
+func NewWithShims(interfacePrefixes []string, ipVersion uint8, dpShim dataplaneIface, timeShim timeIface) *RouteTable {
 	prefixSet := set.New()
 	regexpParts := []string{}
 	for _, prefix := range interfacePrefixes {
@@ -114,9 +122,12 @@ func NewWithShims(interfacePrefixes []string, ipVersion uint8, nl dataplaneIface
 		ifacePrefixes:             prefixSet,
 		ifacePrefixRegexp:         regexp.MustCompile(ifaceNamePattern),
 		ifaceNameToTargets:        map[string][]Target{},
+		ifaceNameToFirstSeen:      map[string]time.Time{},
 		pendingIfaceNameToTargets: map[string][]Target{},
 		dirtyIfaces:               set.New(),
-		dataplane:                 nl,
+		pendingConntrackCleanups:  map[ip.Addr]chan struct{}{},
+		dataplane:                 dpShim,
+		time:                      timeShim,
 	}
 }
 
@@ -129,7 +140,15 @@ func (r *RouteTable) OnIfaceStateChanged(ifaceName string, state ifacemonitor.St
 	if state == ifacemonitor.StateUp {
 		logCxt.Debug("Interface up, marking for route sync")
 		r.dirtyIfaces.Add(ifaceName)
+		r.onIfaceSeen(ifaceName)
 	}
+}
+
+func (r *RouteTable) onIfaceSeen(ifaceName string) {
+	if _, ok := r.ifaceNameToFirstSeen[ifaceName]; ok {
+		return
+	}
+	r.ifaceNameToFirstSeen[ifaceName] = r.time.Now()
 }
 
 func (r *RouteTable) SetRoutes(ifaceName string, targets []Target) {
@@ -163,13 +182,31 @@ func (r *RouteTable) Apply() error {
 				r.logCxt.WithField("ifaceName", ifaceName).Debug(
 					"Resync: found calico-owned interface")
 				r.dirtyIfaces.Add(ifaceName)
+				r.onIfaceSeen(ifaceName)
 			}
+		}
+		// Clean up first-seen timestamps for old interfaces.
+		// Resyncs happen periodically, so the amount of memory leaked to old
+		// first seen timestamps is small.
+		for name, firstSeen := range r.ifaceNameToFirstSeen {
+			if r.dirtyIfaces.Contains(name) {
+				// Interface still present.
+				continue
+			}
+			if time.Since(firstSeen) < cleanupGracePeriod {
+				// Interface first seen recently.
+				continue
+			}
+			log.WithField("ifaceName", name).Debug(
+				"Cleaning up timestamp for removed interface.")
+			delete(r.ifaceNameToFirstSeen, name)
 		}
 		r.inSync = true
 
 		listIfaceTime.Observe(monotime.Since(listStartTime).Seconds())
 	}
 
+	graceIfaces := 0
 	r.dirtyIfaces.Iter(func(item interface{}) error {
 		retries := 2
 		ifaceName := item.(string)
@@ -182,6 +219,10 @@ func (r *RouteTable) Apply() error {
 			} else if err == IfaceDown {
 				logCxt.Info("Interface down, will retry if it goes up.")
 				break
+			} else if err == IfaceGrace {
+				logCxt.Info("Interface in cleanup grace period, will retry after.")
+				graceIfaces++
+				return nil
 			} else if err != nil {
 				logCxt.WithError(err).Warn("Failed to syncronise routes.")
 				retries--
@@ -199,7 +240,12 @@ func (r *RouteTable) Apply() error {
 		return set.RemoveItem
 	})
 
-	if r.dirtyIfaces.Len() > 0 {
+	r.cleanUpPendingConntrackDeletions()
+
+	// Don't return a failure if there are only interfaces in the cleanup grace period.
+	// They'll be retried on the next invocation (the route refresh timer), and we mustn't
+	// count them as Sync Errors.
+	if r.dirtyIfaces.Len() > graceIfaces {
 		r.logCxt.Warn("Some interfaces still out-of sync.")
 		r.inSync = false
 		return UpdateFailed
@@ -216,9 +262,19 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 	logCxt := r.logCxt.WithField("ifaceName", ifaceName)
 	logCxt.Debug("Syncing interface routes")
 
+	// In order to allow Calico to run without Felix in an emergency, the CNI plugin pre-adds
+	// the route to the interface.  To avoid flapping the route when Felix sees the interface
+	// before learning about the endpoint, we give each interface a grace period after we first
+	// see it before we remove routes that we're not expecting.  Check whether the grace period
+	// applies to this interface.
+	inGracePeriod := r.time.Since(r.ifaceNameToFirstSeen[ifaceName]) < cleanupGracePeriod
+	leaveDirty := false
+
 	// If this is a modify or delete, grab a copy of the existing targets so we can clean up
 	// conntrack entries even if the routes have been removed.  We'll remove any still-required
-	// CIDRs from this set below.
+	// CIDRs from this set below.  We don't apply the grace period to this calculation because
+	// it only removes routes that the datamodel previously said were there and then were
+	// removed.  In that case, we know we're up to date.
 	oldCIDRs := set.New()
 	if updatedTargets, ok := r.pendingIfaceNameToTargets[ifaceName]; ok {
 		logCxt.Debug("Have updated targets.")
@@ -250,7 +306,7 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 	defer oldCIDRs.Iter(func(item interface{}) error {
 		// Remove and conntrack entries that should no longer be there.
 		dest := item.(ip.CIDR)
-		r.dataplane.RemoveConntrackFlows(dest.Version(), dest.Addr().AsNetIP())
+		r.startConntrackDeletion(dest.Addr())
 		return nil
 	})
 
@@ -293,22 +349,30 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 		if route.Dst != nil {
 			dest = ip.CIDRFromIPNet(route.Dst)
 		}
-		if !expectedCIDRs.Contains(dest) {
-			logCxt := logCxt.WithField("dest", dest)
-			logCxt.Info("Syncing routes: removing old route.")
-			if err := r.dataplane.RouteDel(&route); err != nil {
-				// Probably a race with the interface being deleted.
-				logCxt.WithError(err).Info(
-					"Route deletion failed, assuming someone got there first.")
-				updatesFailed = true
-			}
-			if dest != nil {
-				// Collect any old route CIDRs that we find in the dataplane so we
-				// can remove their conntrack entries later.
-				oldCIDRs.Add(dest)
-			}
-		}
+		logCxt := logCxt.WithField("dest", dest)
 		seenCIDRs.Add(dest)
+		if expectedCIDRs.Contains(dest) {
+			logCxt.Debug("Syncing routes: Found expected route.")
+			continue
+		}
+		if inGracePeriod {
+			// Don't remove routes from interfaces created recently.
+			logCxt.Info("Syncing routes: found unexpected route; ignoring due to grace period.")
+			leaveDirty = true
+			continue
+		}
+		logCxt.Info("Syncing routes: removing old route.")
+		if err := r.dataplane.RouteDel(&route); err != nil {
+			// Probably a race with the interface being deleted.
+			logCxt.WithError(err).Info(
+				"Route deletion failed, assuming someone got there first.")
+			updatesFailed = true
+		}
+		if dest != nil {
+			// Collect any old route CIDRs that we find in the dataplane so we
+			// can remove their conntrack entries later.
+			oldCIDRs.Add(dest)
+		}
 	}
 	for _, target := range expectedTargets {
 		cidr := target.CIDR
@@ -323,6 +387,9 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 				Protocol:  syscall.RTPROT_BOOT,
 				Scope:     netlink.SCOPE_LINK,
 			}
+			// In case this IP is being re-used, wait for any previous conntrack entry
+			// to be cleaned up.  (No-op if there are no pending deletes.)
+			r.waitForPendingConntrackDeletion(cidr.Addr())
 			if err := r.dataplane.RouteAdd(&route); err != nil {
 				logCxt.WithError(err).Warn("Failed to add route")
 				updatesFailed = true
@@ -344,7 +411,55 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 		return r.filterErrorByIfaceState(ifaceName, UpdateFailed, UpdateFailed)
 	}
 
+	if leaveDirty {
+		// Superfluous routes on a recently created interface.  We'll recheck later.
+		return IfaceGrace
+	}
+
 	return nil
+}
+
+// startConntrackDeletion starts the deletion of conntrack entries for the given CIDR in the background.  Pending
+// deletions are tracked in the pendingConntrackCleanups map so we can block waiting for them later.
+//
+// It's important to do the conntrack deletions in the background because scanning the conntrack
+// table is very slow if there are a lot of entries.  Previously, we did the deletion synchronously
+// but that led to lengthy Apply() calls on the critical path.
+func (r *RouteTable) startConntrackDeletion(ipAddr ip.Addr) {
+	log.WithField("ip", ipAddr).Debug("Starting goroutine to delete conntrack entries")
+	done := make(chan struct{})
+	r.pendingConntrackCleanups[ipAddr] = done
+	go func() {
+		defer close(done)
+		r.dataplane.RemoveConntrackFlows(r.ipVersion, ipAddr.AsNetIP())
+		log.WithField("ip", ipAddr).Debug("Deleted conntrack entries")
+	}()
+}
+
+// cleanUpPendingConntrackDeletions scans the pendingConntrackCleanups map for completed entries and removes them.
+func (r *RouteTable) cleanUpPendingConntrackDeletions() {
+	for ipAddr, c := range r.pendingConntrackCleanups {
+		select {
+		case <-c:
+			log.WithField("ip", ipAddr).Debug(
+				"Background goroutine finished deleting conntrack entries")
+			delete(r.pendingConntrackCleanups, ipAddr)
+		default:
+			log.WithField("ip", ipAddr).Debug(
+				"Background goroutine yet to finish deleting conntrack entries")
+			continue
+		}
+	}
+}
+
+// waitForPendingConntrackDeletion waits for any pending conntrack deletions (if any) for the given IP to complete.
+func (r *RouteTable) waitForPendingConntrackDeletion(ipAddr ip.Addr) {
+	if c := r.pendingConntrackCleanups[ipAddr]; c != nil {
+		log.WithField("ip", ipAddr).Info("Waiting for pending conntrack deletion to finish")
+		<-c
+		log.WithField("ip", ipAddr).Info("Done waiting for pending conntrack deletion to finish")
+		delete(r.pendingConntrackCleanups, ipAddr)
+	}
 }
 
 // filterErrorByIfaceState checks the current state of the interface; if it's down or gone, it

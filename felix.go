@@ -32,10 +32,10 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/docopt/docopt-go"
+	docopt "github.com/docopt/docopt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -55,6 +55,7 @@ import (
 	"github.com/projectcalico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/libcalico-go/lib/health"
 	"github.com/projectcalico/typha/pkg/syncclient"
 )
 
@@ -226,19 +227,27 @@ configRetry:
 	buildInfoLogCxt.WithField("config", configParams).Info(
 		"Successfully loaded configuration.")
 
+	// Health monitoring, for liveness and readiness endpoints.
+	healthAggregator := health.NewHealthAggregator()
+
 	// Start up the dataplane driver.  This may be the internal go-based driver or an external
 	// one.
 	var dpDriver dataplaneDriver
 	var dpDriverCmd *exec.Cmd
 	if configParams.UseInternalDataplaneDriver {
 		log.Info("Using internal dataplane driver.")
+		// Dedicated mark bits for accept and pass actions.  These are long lived bits
+		// that we use for communicating between chains.
 		markAccept := configParams.NextIptablesMark()
 		markPass := configParams.NextIptablesMark()
-		markWorkload := configParams.NextIptablesMark()
+		// Short-lived mark bits for local calculations within a chain.
+		markScratch0 := configParams.NextIptablesMark()
+		markScratch1 := configParams.NextIptablesMark()
 		log.WithFields(log.Fields{
 			"acceptMark":   markAccept,
 			"passMark":     markPass,
-			"workloadMark": markWorkload,
+			"scratch0Mark": markScratch0,
+			"scratch1Mark": markScratch1,
 		}).Info("Calculated iptables mark bits")
 		dpConfig := intdataplane.Config{
 			RulesConfig: rules.Config{
@@ -261,15 +270,18 @@ configRetry:
 				OpenStackMetadataIP:          net.ParseIP(configParams.MetadataAddr),
 				OpenStackMetadataPort:        uint16(configParams.MetadataPort),
 
-				IptablesMarkAccept:       markAccept,
-				IptablesMarkPass:         markPass,
-				IptablesMarkFromWorkload: markWorkload,
+				IptablesMarkAccept:   markAccept,
+				IptablesMarkPass:     markPass,
+				IptablesMarkScratch0: markScratch0,
+				IptablesMarkScratch1: markScratch1,
 
 				IPIPEnabled:       configParams.IpInIpEnabled,
 				IPIPTunnelAddress: configParams.IpInIpTunnelAddr,
 
-				IptablesLogPrefix:    configParams.LogPrefix,
-				EndpointToHostAction: configParams.DefaultEndpointToHostAction,
+				IptablesLogPrefix:         configParams.LogPrefix,
+				EndpointToHostAction:      configParams.DefaultEndpointToHostAction,
+				IptablesFilterAllowAction: configParams.IptablesFilterAllowAction,
+				IptablesMangleAllowAction: configParams.IptablesMangleAllowAction,
 
 				FailsafeInboundHostPorts:  configParams.FailsafeInboundHostPorts,
 				FailsafeOutboundHostPorts: configParams.FailsafeOutboundHostPorts,
@@ -278,14 +290,20 @@ configRetry:
 			},
 			IPIPMTU:                        configParams.IpInIpMtu,
 			IptablesRefreshInterval:        configParams.IptablesRefreshInterval,
+			RouteRefreshInterval:           configParams.RouteRefreshInterval,
+			IPSetsRefreshInterval:          configParams.IpsetsRefreshInterval,
 			IptablesPostWriteCheckInterval: configParams.IptablesPostWriteCheckIntervalSecs,
 			IptablesInsertMode:             configParams.ChainInsertMode,
+			IptablesLockFilePath:           configParams.IptablesLockFilePath,
+			IptablesLockTimeout:            configParams.IptablesLockTimeoutSecs,
+			IptablesLockProbeInterval:      configParams.IptablesLockProbeIntervalMillis,
 			MaxIPSetSize:                   configParams.MaxIpsetSize,
 			IgnoreLooseRPF:                 configParams.IgnoreLooseRPF,
 			IPv6Enabled:                    configParams.Ipv6Support,
 			StatusReportingInterval:        configParams.ReportingIntervalSecs,
 
 			PostInSyncCallback: func() { dumpHeapMemoryProfile(configParams) },
+			HealthAggregator:   healthAggregator,
 		}
 		intDP := intdataplane.NewIntDataplaneDriver(dpConfig)
 		intDP.Start()
@@ -338,7 +356,7 @@ configRetry:
 	// Create the ipsets/active policy calculation graph, which will
 	// do the dynamic calculation of ipset memberships and active policies
 	// etc.
-	asyncCalcGraph := calc.NewAsyncCalcGraph(configParams, dpConnector.ToDataplane)
+	asyncCalcGraph := calc.NewAsyncCalcGraph(configParams, dpConnector.ToDataplane, healthAggregator)
 
 	if configParams.UsageReportingEnabled {
 		// Usage reporting enabled, add stats collector to graph.  When it detects an update
@@ -379,6 +397,7 @@ configRetry:
 			24*time.Hour,
 			configParams.ClusterGUID,
 			configParams.ClusterType,
+			configParams.CalicoVersion,
 			statsChanOut,
 		)
 	} else {
@@ -447,6 +466,11 @@ configRetry:
 		gaugeHost.Set(1)
 		prometheus.MustRegister(gaugeHost)
 		go servePrometheusMetrics(configParams)
+	}
+
+	if configParams.HealthEnabled {
+		log.WithField("port", configParams.HealthPort).Info("Health enabled.  Starting server.")
+		go healthAggregator.ServeHTTP(configParams.HealthPort)
 	}
 
 	// On receipt of SIGUSR1, write out heap profile.

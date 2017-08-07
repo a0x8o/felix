@@ -22,7 +22,7 @@ import (
 	"github.com/projectcalico/felix/iptables"
 	"github.com/projectcalico/felix/proto"
 	"github.com/projectcalico/felix/rules"
-	"github.com/projectcalico/felix/set"
+	"github.com/projectcalico/libcalico-go/lib/set"
 )
 
 var _ = Describe("Masquerade manager", func() {
@@ -43,6 +43,10 @@ var _ = Describe("Masquerade manager", func() {
 				nil,
 				nil,
 			),
+			IptablesMarkPass:     0x1,
+			IptablesMarkAccept:   0x2,
+			IptablesMarkScratch0: 0x4,
+			IptablesMarkScratch1: 0x8,
 		})
 		masqMgr = newMasqManager(ipSets, natTable, ruleRenderer, 1024, 4)
 	})

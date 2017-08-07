@@ -18,7 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/felix/proto"
 	"github.com/projectcalico/libcalico-go/lib/net"
@@ -86,17 +86,17 @@ func parsedRuleToProtoRule(in *ParsedRule) *proto.Rule {
 
 		Protocol: protocolToProtoProtocol(in.Protocol),
 
-		SrcNet:      ipNetToProtoString(in.SrcNet),
+		SrcNet:      ipNetsToProtoStrings(in.SrcNets),
 		SrcPorts:    portsToProtoPorts(in.SrcPorts),
-		DstNet:      ipNetToProtoString(in.DstNet),
+		DstNet:      ipNetsToProtoStrings(in.DstNets),
 		DstPorts:    portsToProtoPorts(in.DstPorts),
 		SrcIpSetIds: in.SrcIPSetIDs,
 		DstIpSetIds: in.DstIPSetIDs,
 
 		NotProtocol:    protocolToProtoProtocol(in.NotProtocol),
-		NotSrcNet:      ipNetToProtoString(in.NotSrcNet),
+		NotSrcNet:      ipNetsToProtoStrings(in.NotSrcNets),
 		NotSrcPorts:    portsToProtoPorts(in.NotSrcPorts),
-		NotDstNet:      ipNetToProtoString(in.NotDstNet),
+		NotDstNet:      ipNetsToProtoStrings(in.NotDstNets),
 		NotDstPorts:    portsToProtoPorts(in.NotDstPorts),
 		NotSrcIpSetIds: in.NotSrcIPSetIDs,
 		NotDstIpSetIds: in.NotDstIPSetIDs,
@@ -182,9 +182,11 @@ func protocolToProtoProtocol(in *numorstring.Protocol) (out *proto.Protocol) {
 	return
 }
 
-func ipNetToProtoString(in *net.IPNet) (out string) {
-	if in != nil {
-		out = in.String()
+func ipNetsToProtoStrings(in []*net.IPNet) (out []string) {
+	for _, n := range in {
+		if n != nil {
+			out = append(out, n.String())
+		}
 	}
 	return
 }

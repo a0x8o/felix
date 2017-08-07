@@ -20,20 +20,20 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"syscall"
+	"time"
 
-	log "github.com/Sirupsen/logrus"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
-	"github.com/projectcalico/felix/ip"
-	"github.com/projectcalico/felix/set"
-	"github.com/projectcalico/felix/testutils"
-
-	"strings"
-
 	"github.com/projectcalico/felix/ifacemonitor"
+	"github.com/projectcalico/felix/ip"
+	"github.com/projectcalico/felix/testutils"
+	"github.com/projectcalico/libcalico-go/lib/set"
 )
 
 var (
@@ -53,6 +53,7 @@ var (
 
 var _ = Describe("RouteTable", func() {
 	var dataplane *mockDataplane
+	var t *mockTime
 	var rt *RouteTable
 
 	BeforeEach(func() {
@@ -62,7 +63,15 @@ var _ = Describe("RouteTable", func() {
 			addedRouteKeys:   set.New(),
 			deletedRouteKeys: set.New(),
 		}
-		rt = NewWithShims([]string{"cali"}, 4, dataplane)
+		startTime, err := time.Parse(time.RFC3339, "2006-01-02T15:04:05Z")
+		Expect(err).NotTo(HaveOccurred())
+		t = &mockTime{
+			currentTime: startTime,
+		}
+		// Setting an auto-increment greater than the route cleanup delay effectively
+		// disables the grace period for these tests.
+		t.setAutoIncrement(11 * time.Second)
+		rt = NewWithShims([]string{"cali"}, 4, dataplane, t)
 	})
 
 	It("should be constructable", func() {
@@ -102,10 +111,70 @@ var _ = Describe("RouteTable", func() {
 			}
 			dataplane.addMockRoute(&gatewayRoute)
 		})
+		It("should wait for the route cleanup delay", func() {
+			t.setAutoIncrement(0 * time.Second)
+			rt.Apply()
+			Expect(dataplane.routeKeyToRoute).To(ConsistOf(cali1Route, cali3Route, gatewayRoute))
+			Expect(dataplane.addedRouteKeys).To(BeEmpty())
+			t.incrementTime(11 * time.Second)
+			rt.Apply()
+			Expect(dataplane.routeKeyToRoute).To(ConsistOf(gatewayRoute))
+			Expect(dataplane.addedRouteKeys).To(BeEmpty())
+		})
+		It("should wait for the route cleanup delay when resyncing", func() {
+			t.setAutoIncrement(0 * time.Second)
+			rt.QueueResync()
+			rt.Apply()
+			Expect(dataplane.routeKeyToRoute).To(ConsistOf(cali1Route, cali3Route, gatewayRoute))
+			Expect(dataplane.addedRouteKeys).To(BeEmpty())
+			t.incrementTime(11 * time.Second)
+			rt.QueueResync()
+			rt.Apply()
+			Expect(dataplane.routeKeyToRoute).To(ConsistOf(gatewayRoute))
+			Expect(dataplane.addedRouteKeys).To(BeEmpty())
+		})
 		It("should clean up only our routes", func() {
 			rt.Apply()
 			Expect(dataplane.routeKeyToRoute).To(ConsistOf(gatewayRoute))
 			Expect(dataplane.addedRouteKeys).To(BeEmpty())
+		})
+		It("should delete only our conntrack entries", func() {
+			rt.Apply()
+			Eventually(dataplane.GetDeletedConntrackEntries).Should(ConsistOf(
+				net.ParseIP("10.0.0.1").To4(),
+				net.ParseIP("10.0.0.3").To4(),
+			))
+		})
+
+		Describe("with a slow conntrack deletion", func() {
+			const delay = 300 * time.Millisecond
+			BeforeEach(func() {
+				dataplane.ConntrackSleep = delay
+			})
+			It("should block a route add until conntrack finished", func() {
+				// Initial apply starts a background thread to delete
+				// 10.0.0.1 and 10.0.0.3.
+				rt.Apply()
+				// We try to add 10.0.0.1 back in.
+				rt.SetRoutes("cali1", []Target{
+					{CIDR: ip.MustParseCIDR("10.0.0.1/32"), DestMAC: mac1},
+				})
+				start := time.Now()
+				rt.Apply()
+				Expect(time.Since(start)).To(BeNumerically(">=", delay*9/10))
+			})
+			It("should not block an unrelated route add ", func() {
+				// Initial apply starts a background thread to delete
+				// 10.0.0.1 and 10.0.0.3.
+				rt.Apply()
+				// We try to add 10.0.0.10, which hasn't been seen before.
+				rt.SetRoutes("cali1", []Target{
+					{CIDR: ip.MustParseCIDR("10.0.0.10/32"), DestMAC: mac1},
+				})
+				start := time.Now()
+				rt.Apply()
+				Expect(time.Since(start)).To(BeNumerically("<", delay/2))
+			})
 		})
 
 		// We do the following tests in different failure (and non-failure) scenarios.  In
@@ -379,6 +448,10 @@ type mockDataplane struct {
 	deletedRouteKeys set.Set
 
 	failuresToSimulate failFlags
+
+	mutex                   sync.Mutex
+	deletedConntrackEntries []net.IP
+	ConntrackSleep          time.Duration
 }
 
 func (d *mockDataplane) addIface(idx int, name string, up bool, running bool) *mockLink {
@@ -506,7 +579,20 @@ func (d *mockDataplane) RemoveConntrackFlows(ipVersion uint8, ipAddr net.IP) {
 	log.WithFields(log.Fields{
 		"ipVersion": ipVersion,
 		"ipAddr":    ipAddr,
+		"sleepTime": d.ConntrackSleep,
 	}).Info("Mock dataplane: Removing conntrack flows")
+	d.mutex.Lock()
+	d.deletedConntrackEntries = append(d.deletedConntrackEntries, ipAddr)
+	d.mutex.Unlock()
+	time.Sleep(d.ConntrackSleep)
+}
+
+func (d *mockDataplane) GetDeletedConntrackEntries() []net.IP {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	cpy := make([]net.IP, len(d.deletedConntrackEntries))
+	copy(cpy, d.deletedConntrackEntries)
+	return cpy
 }
 
 func keyForRoute(route *netlink.Route) string {
@@ -525,4 +611,26 @@ func (l *mockLink) Attrs() *netlink.LinkAttrs {
 
 func (l *mockLink) Type() string {
 	return "not-implemented"
+}
+
+type mockTime struct {
+	currentTime   time.Time
+	autoIncrement time.Duration
+}
+
+func (m *mockTime) Now() time.Time {
+	t := m.currentTime
+	m.incrementTime(m.autoIncrement)
+	return t
+}
+func (m *mockTime) Since(t time.Time) time.Duration {
+	return m.Now().Sub(t)
+}
+
+func (m *mockTime) setAutoIncrement(t time.Duration) {
+	m.autoIncrement = t
+}
+
+func (m *mockTime) incrementTime(t time.Duration) {
+	m.currentTime = m.currentTime.Add(t)
 }

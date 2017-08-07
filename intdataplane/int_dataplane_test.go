@@ -24,12 +24,15 @@ import (
 	"github.com/projectcalico/felix/intdataplane"
 	"github.com/projectcalico/felix/ipsets"
 	"github.com/projectcalico/felix/rules"
+	"github.com/projectcalico/libcalico-go/lib/health"
 )
 
 var _ = Describe("Constructor test", func() {
 	var configParams *config.Config
 	var dpConfig intdataplane.Config
-	BeforeEach(func() {
+	var healthAggregator *health.HealthAggregator
+
+	JustBeforeEach(func() {
 		configParams = config.New()
 		dpConfig = intdataplane.Config{
 			RulesConfig: rules.Config{
@@ -52,20 +55,37 @@ var _ = Describe("Constructor test", func() {
 				OpenStackMetadataIP:          net.ParseIP(configParams.MetadataAddr),
 				OpenStackMetadataPort:        uint16(configParams.MetadataPort),
 
-				IptablesMarkAccept: 0x1000000,
-				IptablesMarkPass:   0x2000000,
+				IptablesMarkAccept:   0x1000000,
+				IptablesMarkPass:     0x2000000,
+				IptablesMarkScratch0: 0x4000000,
+				IptablesMarkScratch1: 0x8000000,
 
 				IPIPEnabled:       configParams.IpInIpEnabled,
 				IPIPTunnelAddress: configParams.IpInIpTunnelAddr,
 
-				EndpointToHostAction: configParams.DefaultEndpointToHostAction,
+				EndpointToHostAction:      configParams.DefaultEndpointToHostAction,
+				IptablesFilterAllowAction: configParams.IptablesFilterAllowAction,
+				IptablesMangleAllowAction: configParams.IptablesMangleAllowAction,
 			},
-			IPIPMTU: configParams.IpInIpMtu,
+			IPIPMTU:          configParams.IpInIpMtu,
+			HealthAggregator: healthAggregator,
 		}
 	})
 
 	It("should be constructable", func() {
 		var dp = intdataplane.NewIntDataplaneDriver(dpConfig)
 		Expect(dp).ToNot(BeNil())
+	})
+
+	Context("with health aggregator", func() {
+
+		BeforeEach(func() {
+			healthAggregator = health.NewHealthAggregator()
+		})
+
+		It("should be constructable", func() {
+			var dp = intdataplane.NewIntDataplaneDriver(dpConfig)
+			Expect(dp).ToNot(BeNil())
+		})
 	})
 })

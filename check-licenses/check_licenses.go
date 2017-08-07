@@ -17,14 +17,14 @@ package main
 import (
 	"os"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 
 	"bufio"
 	"regexp"
 	"strings"
 
 	"github.com/projectcalico/felix/logutils"
-	"github.com/projectcalico/felix/set"
+	"github.com/projectcalico/libcalico-go/lib/set"
 )
 
 var (

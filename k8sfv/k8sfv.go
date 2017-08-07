@@ -15,15 +15,15 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"strings"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/golang/protobuf/proto"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
+	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
@@ -63,12 +63,6 @@ var (
 
 var _ = BeforeSuite(func() {
 	log.Info(">>> BeforeSuite <<<")
-	// Get and log command line args.
-	k8sServerEndpoint = flag.Arg(0)
-	felixIP = flag.Arg(1)
-	felixHostname = flag.Arg(2)
-	prometheusPushURL = flag.Arg(3)
-	codeLevel = flag.Arg(4)
 	log.WithFields(log.Fields{
 		"k8sServerEndpoint": k8sServerEndpoint,
 		"felixIP":           felixIP,
@@ -84,7 +78,12 @@ var _ = BeforeSuite(func() {
 	prometheus.MustRegister(gaugeVecTestResult)
 })
 
-var testName string
+// State that is common to most tests.
+var (
+	testName             string
+	d                    deployment
+	localFelixConfigured bool
+)
 
 var _ = JustBeforeEach(func() {
 	log.Info(">>> JustBeforeEach <<<")
@@ -93,6 +92,14 @@ var _ = JustBeforeEach(func() {
 
 var _ = AfterEach(func() {
 	log.Info(">>> AfterEach <<<")
+
+	// If we got as far as fully configuring the local Felix, check that the test finishes with
+	// no left-over endpoints.
+	if localFelixConfigured {
+		Eventually(getNumEndpointsDefault(-1), "10s", "1s").Should(BeNumerically("==", 0))
+	}
+
+	// Store the result of each test in a Prometheus metric.
 	result := float64(1)
 	if CurrentGinkgoTestDescription().Failed {
 		result = 0
@@ -173,7 +180,7 @@ func initializeCalicoDeployment(k8sServerEndpoint string) {
 
 func create1000Pods(clientset *kubernetes.Clientset, nsPrefix string) error {
 
-	d := NewDeployment(clientset, 49, true)
+	d = NewDeployment(clientset, 49, true)
 	nsName := nsPrefix + "test"
 
 	// Create 1000 pods.

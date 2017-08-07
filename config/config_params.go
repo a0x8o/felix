@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/libcalico-go/lib/api"
 	"github.com/projectcalico/libcalico-go/lib/client"
@@ -109,8 +109,14 @@ type Config struct {
 	Ipv6Support    bool `config:"bool;true"`
 	IgnoreLooseRPF bool `config:"bool;false"`
 
-	IptablesRefreshInterval            time.Duration `config:"seconds;10"`
+	RouteRefreshInterval               time.Duration `config:"seconds;90"`
+	IptablesRefreshInterval            time.Duration `config:"seconds;90"`
 	IptablesPostWriteCheckIntervalSecs time.Duration `config:"seconds;1"`
+	IptablesLockFilePath               string        `config:"file;/run/xtables.lock"`
+	IptablesLockTimeoutSecs            time.Duration `config:"seconds;0"`
+	IptablesLockProbeIntervalMillis    time.Duration `config:"millis;50"`
+	IpsetsRefreshInterval              time.Duration `config:"seconds;10"`
+	MaxIpsetSize                       int           `config:"int;1048576;non-zero"`
 
 	MetadataAddr string `config:"hostname;127.0.0.1;die-on-fail"`
 	MetadataPort int    `config:"int(0,65535);8775;die-on-fail"`
@@ -119,6 +125,8 @@ type Config struct {
 
 	ChainInsertMode             string `config:"oneof(insert,append);insert;non-zero,die-on-fail"`
 	DefaultEndpointToHostAction string `config:"oneof(DROP,RETURN,ACCEPT);DROP;non-zero,die-on-fail"`
+	IptablesFilterAllowAction   string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
+	IptablesMangleAllowAction   string `config:"oneof(ACCEPT,RETURN);ACCEPT;non-zero,die-on-fail"`
 	LogPrefix                   string `config:"string;calico-packet"`
 
 	LogFilePath string `config:"file;/var/log/calico/felix.log;die-on-fail"`
@@ -137,12 +145,12 @@ type Config struct {
 	EndpointReportingEnabled   bool          `config:"bool;false"`
 	EndpointReportingDelaySecs time.Duration `config:"seconds;1"`
 
-	MaxIpsetSize int `config:"int;1048576;non-zero"`
-
 	IptablesMarkMask uint32 `config:"mark-bitmask;0xff000000;non-zero,die-on-fail"`
 
 	DisableConntrackInvalidCheck bool `config:"bool;false"`
 
+	HealthEnabled                   bool `config:"bool;false"`
+	HealthPort                      int  `config:"int(0,65535);9099"`
 	PrometheusMetricsEnabled        bool `config:"bool;false"`
 	PrometheusMetricsPort           int  `config:"int(0,65535);9091"`
 	PrometheusGoMetricsEnabled      bool `config:"bool;true"`
@@ -154,6 +162,7 @@ type Config struct {
 	UsageReportingEnabled bool   `config:"bool;true"`
 	ClusterGUID           string `config:"string;baddecaf"`
 	ClusterType           string `config:"string;"`
+	CalicoVersion         string `config:"string;"`
 
 	DebugMemoryProfilePath  string `config:"file;;"`
 	DebugDisableLogDropping bool   `config:"bool;false"`
@@ -455,6 +464,8 @@ func loadParams() {
 			param = &FloatParam{}
 		case "seconds":
 			param = &SecondsParam{}
+		case "millis":
+			param = &MillisParam{}
 		case "iface-list":
 			param = &RegexpParam{Regexp: IfaceListRegexp,
 				Msg: "invalid Linux interface name"}

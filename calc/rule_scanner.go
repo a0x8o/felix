@@ -14,16 +14,17 @@
 package calc
 
 import (
-	log "github.com/Sirupsen/logrus"
-
 	"fmt"
 
-	"github.com/projectcalico/felix/multidict"
-	"github.com/projectcalico/felix/set"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/projectcalico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/libcalico-go/lib/net"
 	"github.com/projectcalico/libcalico-go/lib/numorstring"
 	"github.com/projectcalico/libcalico-go/lib/selector"
+	"github.com/projectcalico/libcalico-go/lib/set"
+
+	"github.com/projectcalico/felix/multidict"
 )
 
 // RuleScanner scans the rules sent to it by the ActiveRulesCalculator, looking for tags and
@@ -73,26 +74,26 @@ func NewRuleScanner() *RuleScanner {
 }
 
 func (rs *RuleScanner) OnProfileActive(key model.ProfileRulesKey, profile *model.ProfileRules) {
-	parsedRules := rs.updateRules(key, profile.InboundRules, profile.OutboundRules, false)
+	parsedRules := rs.updateRules(key, profile.InboundRules, profile.OutboundRules, false, false)
 	rs.RulesUpdateCallbacks.OnProfileActive(key, parsedRules)
 }
 
 func (rs *RuleScanner) OnProfileInactive(key model.ProfileRulesKey) {
-	rs.updateRules(key, nil, nil, false)
+	rs.updateRules(key, nil, nil, false, false)
 	rs.RulesUpdateCallbacks.OnProfileInactive(key)
 }
 
 func (rs *RuleScanner) OnPolicyActive(key model.PolicyKey, policy *model.Policy) {
-	parsedRules := rs.updateRules(key, policy.InboundRules, policy.OutboundRules, policy.DoNotTrack)
+	parsedRules := rs.updateRules(key, policy.InboundRules, policy.OutboundRules, policy.DoNotTrack, policy.PreDNAT)
 	rs.RulesUpdateCallbacks.OnPolicyActive(key, parsedRules)
 }
 
 func (rs *RuleScanner) OnPolicyInactive(key model.PolicyKey) {
-	rs.updateRules(key, nil, nil, false)
+	rs.updateRules(key, nil, nil, false, false)
 	rs.RulesUpdateCallbacks.OnPolicyInactive(key)
 }
 
-func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Rule, untracked bool) (parsedRules *ParsedRules) {
+func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Rule, untracked, preDNAT bool) (parsedRules *ParsedRules) {
 	log.Debugf("Scanning rules (%v in, %v out) for key %v",
 		len(inbound), len(outbound), key)
 	// Extract all the new selectors/tags.
@@ -117,6 +118,7 @@ func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Ru
 		InboundRules:  parsedInbound,
 		OutboundRules: parsedOutbound,
 		Untracked:     untracked,
+		PreDNAT:       preDNAT,
 	}
 
 	// Figure out which selectors/tags are new.
@@ -182,6 +184,9 @@ type ParsedRules struct {
 
 	// Untracked is true if these rules should not be "conntracked".
 	Untracked bool
+
+	// PreDNAT is true if these rules should be applied before any DNAT.
+	PreDNAT bool
 }
 
 // Rule is like a backend.model.Rule, except the tag and selector matches are
@@ -193,9 +198,9 @@ type ParsedRule struct {
 
 	Protocol *numorstring.Protocol
 
-	SrcNet      *net.IPNet
+	SrcNets     []*net.IPNet
 	SrcPorts    []numorstring.Port
-	DstNet      *net.IPNet
+	DstNets     []*net.IPNet
 	DstPorts    []numorstring.Port
 	ICMPType    *int
 	ICMPCode    *int
@@ -203,9 +208,9 @@ type ParsedRule struct {
 	DstIPSetIDs []string
 
 	NotProtocol    *numorstring.Protocol
-	NotSrcNet      *net.IPNet
+	NotSrcNets     []*net.IPNet
 	NotSrcPorts    []numorstring.Port
-	NotDstNet      *net.IPNet
+	NotDstNets     []*net.IPNet
 	NotDstPorts    []numorstring.Port
 	NotICMPType    *int
 	NotICMPCode    *int
@@ -223,9 +228,9 @@ func ruleToParsedRule(rule *model.Rule) (parsedRule *ParsedRule, allTagOrSels []
 
 		Protocol: rule.Protocol,
 
-		SrcNet:      rule.SrcNet,
+		SrcNets:     rule.AllSrcNets(),
 		SrcPorts:    rule.SrcPorts,
-		DstNet:      rule.DstNet,
+		DstNets:     rule.AllDstNets(),
 		DstPorts:    rule.DstPorts,
 		ICMPType:    rule.ICMPType,
 		ICMPCode:    rule.ICMPCode,
@@ -233,9 +238,9 @@ func ruleToParsedRule(rule *model.Rule) (parsedRule *ParsedRule, allTagOrSels []
 		DstIPSetIDs: selectors(dst).ToUIDs(),
 
 		NotProtocol:    rule.NotProtocol,
-		NotSrcNet:      rule.NotSrcNet,
+		NotSrcNets:     rule.AllNotSrcNets(),
 		NotSrcPorts:    rule.NotSrcPorts,
-		NotDstNet:      rule.NotDstNet,
+		NotDstNets:     rule.AllNotDstNets(),
 		NotDstPorts:    rule.NotDstPorts,
 		NotICMPType:    rule.NotICMPType,
 		NotICMPCode:    rule.NotICMPCode,
