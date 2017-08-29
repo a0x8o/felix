@@ -2,7 +2,7 @@
 
 Name:           felix
 Summary:        Project Calico virtual networking for cloud data centers
-Version:        2.4.1
+Version:        2.5.0
 Release:        1%{?dist}
 License:        Apache-2
 URL:            http://projectcalico.org
@@ -152,6 +152,15 @@ rm -rf $RPM_BUILD_ROOT
 
 
 %changelog
+* Tue Aug 22 2017 Neil Jerram <neil@tigera.io> 2.5.0-1
+  - Felix 2.5.0 (from Git commit daa250c).
+    [Changes recorded in 2.5.0 tag]
+    - Test fix: use local crd manifest file instead of pulling from libcalico-go repository See: #1530
+    - Fix deb and RPM changelogs to include 2.2.x releases.
+    [Changes recorded in 2.5.0-rc1 tag]
+    - Update to libcalico v1.6.0 and typha v0.4.0.
+    - Update k8sfv to be compatible with k8s 1.7 + CRDs
+
 * Thu Aug 10 2017 Neil Jerram <neil@tigera.io> 2.4.1-1
   - Felix 2.4.1 (from Git commit 0ee59e4).
     [Changes recorded in 2.4.1 tag]
@@ -234,6 +243,11 @@ rm -rf $RPM_BUILD_ROOT
     [Changes recorded in 2.3.0-rc2 tag]
     - Update libcalico to v1.4.0
     [Changes recorded in 2.3.0-rc1 tag]
+    [Changes recorded in 2.2.2 tag]
+    - Pin libcalico-go to v1.2.2 to pick up memory leak fix (#1457).
+
+* Tue May 16 2017 Neil Jerram <neil@tigera.io> 2.2.2-1
+  - Felix 2.2.2 (from Git commit 9c92a96).
     [Changes recorded in 2.2.2 tag]
     - Pin libcalico-go to v1.2.2 to pick up memory leak fix (#1457).
 

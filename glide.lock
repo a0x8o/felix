@@ -1,6 +1,11 @@
-hash: 55b1bb6ca3ac60a923e1997963a2e8735895191745dcf8e55d3f2246c7d49a94
-updated: 2017-08-07T10:04:37.816424735-07:00
+hash: da8a8061d5ca9db1b8820c6b289a116a0875436650a1c6cd98cd8edbe511a450
+updated: 2017-08-21T15:51:25.351367412Z
 imports:
+- name: cloud.google.com/go
+  version: 3b1ae45394a234c385be014e9a488f2bb6eef821
+  subpackages:
+  - compute/metadata
+  - internal
 - name: github.com/beorn7/perks
   version: 4c0e84591b9aa9e6dcfdf3e020114cd81f89d5f9
   subpackages:
@@ -19,6 +24,14 @@ imports:
   - pkg/tlsutil
   - pkg/transport
   - pkg/types
+- name: github.com/coreos/go-oidc
+  version: be73733bb8cc830d0205609b95d125215f8e9c70
+  subpackages:
+  - http
+  - jose
+  - key
+  - oauth2
+  - oidc
 - name: github.com/coreos/go-systemd
   version: 2688e91251d9d8e404e86dd8f096e23b2f086958
   subpackages:
@@ -52,7 +65,7 @@ imports:
 - name: github.com/ghodss/yaml
   version: 0ca9ea5df5451ffdf184b4428c902747c2c11cd7
 - name: github.com/go-ini/ini
-  version: d3de07a94d22b4a0972deb4b96d790c2c0ce8333
+  version: 20b96f641a5ea98f2f8619ff4f3e061cff4833bd
 - name: github.com/go-openapi/jsonpointer
   version: 46af16f9f7b149af66e5d1bd010e3574dc06de98
 - name: github.com/go-openapi/jsonreference
@@ -69,7 +82,7 @@ imports:
 - name: github.com/golang/glog
   version: 44145f04b68cf362d9c4df2182967c2275eaefed
 - name: github.com/golang/protobuf
-  version: 748d386b5c1ea99658fd69fe9f03991ce86a90c1
+  version: ab9f9a6dab164b7d1246e0e688b0ab7b94d8553e
   subpackages:
   - proto
 - name: github.com/google/gofuzz
@@ -78,6 +91,8 @@ imports:
   version: 3ca23474a7c7203e0a0a070fd33508f6efdb9b3d
 - name: github.com/imdario/mergo
   version: 6633656539c1639d9d78127b7d47c622b5d7b6dc
+- name: github.com/jonboulle/clockwork
+  version: 72f9bd7c4e0c2a40055ab3d0f09654f730cce982
 - name: github.com/juju/ratelimit
   version: 77ed1c8a01217656d2080ad51981f6e99adaa177
 - name: github.com/kardianos/osext
@@ -140,7 +155,7 @@ imports:
 - name: github.com/projectcalico/go-yaml-wrapper
   version: 598e54215bee41a19677faa4f0c32acd2a87eb56
 - name: github.com/projectcalico/libcalico-go
-  version: d57562ced98d850282636bb5da16c840ea74b7df
+  version: fc4a3648215b9beda5d08e26d76e91f12fb45079
   subpackages:
   - lib
   - lib/api
@@ -150,8 +165,8 @@ imports:
   - lib/backend/compat
   - lib/backend/etcd
   - lib/backend/k8s
+  - lib/backend/k8s/custom
   - lib/backend/k8s/resources
-  - lib/backend/k8s/thirdparty
   - lib/backend/model
   - lib/client
   - lib/converter
@@ -171,7 +186,7 @@ imports:
   - lib/testutils
   - lib/validator
 - name: github.com/projectcalico/typha
-  version: 5e3fcf3a305f8e24a27aa663323eddf54b0a515a
+  version: ec14f2716227ed72aff32691071f4b450367930a
   subpackages:
   - pkg/syncclient
   - pkg/syncproto
@@ -210,7 +225,7 @@ imports:
   subpackages:
   - codec
 - name: github.com/vishvananda/netlink
-  version: 70cf3c74a89e4ca3847f109e77490a40e5639965
+  version: f5a6f697a596c788d474984a38a0ac4ba0719e93
   subpackages:
   - nl
 - name: github.com/vishvananda/netns
@@ -223,6 +238,7 @@ imports:
   version: 3da985ce5951d99de868be4385f21ea6c2b22f24
   subpackages:
   - context
+  - context/ctxhttp
   - html
   - html/atom
   - html/charset
@@ -230,8 +246,15 @@ imports:
   - http2/hpack
   - idna
   - lex/httplex
+- name: golang.org/x/oauth2
+  version: 3c3a985cb79f52a3190fbc056984415ca6763d01
+  subpackages:
+  - google
+  - internal
+  - jws
+  - jwt
 - name: golang.org/x/sys
-  version: d8f5ea21b9295e315e612b4bcf4bedea93454d4d
+  version: 07c182904dbd53199946ba614a412c61d3c548f5
   subpackages:
   - unix
 - name: golang.org/x/text
@@ -259,6 +282,18 @@ imports:
   - unicode/bidi
   - unicode/norm
   - width
+- name: google.golang.org/appengine
+  version: 4f7eeb5305a4ba1966344836ba4af9996b7b4e05
+  subpackages:
+  - internal
+  - internal/app_identity
+  - internal/base
+  - internal/datastore
+  - internal/log
+  - internal/modules
+  - internal/remote_api
+  - internal/urlfetch
+  - urlfetch
 - name: gopkg.in/go-playground/validator.v8
   version: 5f1438d3fca68893a817e4a66806cea46a9e4ebf
 - name: gopkg.in/inf.v0
@@ -380,8 +415,12 @@ imports:
   - pkg/util
   - pkg/util/parsers
   - pkg/version
+  - plugin/pkg/client/auth
+  - plugin/pkg/client/auth/gcp
+  - plugin/pkg/client/auth/oidc
   - rest
   - rest/watch
+  - third_party/forked/golang/template
   - tools/auth
   - tools/cache
   - tools/clientcmd
@@ -395,4 +434,5 @@ imports:
   - util/flowcontrol
   - util/homedir
   - util/integer
+  - util/jsonpath
 testImports: []
