@@ -40,6 +40,26 @@
 #            +----------------------------+    +--------------+
 #
 #
+#
+###############################################################################
+# The build architecture is select by setting the ARCH variable.
+# For example: When building on ppc64le you could use ARCH=ppc64le make <....>.
+# When ARCH is undefined it defaults to amd64.
+ifdef ARCH
+	ARCHTAG:=-$(ARCH)
+endif
+ARCH?=amd64
+ARCHTAG?=
+
+ifeq ($(ARCH),amd64)
+GO_BUILD_VER:=v0.6
+endif
+
+ifeq ($(ARCH),ppc64le)
+GO_BUILD_VER:=latest
+endif
+
+GO_BUILD_CONTAINER?=calico/go-build$(ARCHTAG):$(GO_BUILD_VER)
 
 help:
 	@echo "Felix Makefile"
@@ -73,14 +93,14 @@ help:
 	@echo "  make go-fmt        Format our go code."
 	@echo "  make clean         Remove binary files."
 
+TOPDIR:=$(shell pwd)
+
 # Disable make's implicit rules, which are not useful for golang, and slow down the build
 # considerably.
 .SUFFIXES:
 
 all: deb rpm calico/felix
 test: ut fv
-
-GO_BUILD_CONTAINER?=calico/go-build:v0.6
 
 # Figure out version information.  To support builds from release tarballs, we default to
 # <unknown> if this isn't a git checkout.
@@ -115,12 +135,12 @@ MY_GID:=$(shell id -g)
 # Build a docker image used for building debs for trusty.
 .PHONY: calico-build/trusty
 calico-build/trusty:
-	cd docker-build-images && docker build -f ubuntu-trusty-build.Dockerfile -t calico-build/trusty .
+	cd docker-build-images && docker build -f ubuntu-trusty-build.Dockerfile$(ARCHTAG) -t calico-build/trusty .
 
 # Build a docker image used for building debs for xenial.
 .PHONY: calico-build/xenial
 calico-build/xenial:
-	cd docker-build-images && docker build -f ubuntu-xenial-build.Dockerfile -t calico-build/xenial .
+	cd docker-build-images && docker build -f ubuntu-xenial-build.Dockerfile$(ARCHTAG) -t calico-build/xenial .
 
 # Construct a docker image for building Centos 7 RPMs.
 .PHONY: calico-build/centos7
@@ -129,8 +149,16 @@ calico-build/centos7:
 	  docker build \
 	  --build-arg=UID=$(MY_UID) \
 	  --build-arg=GID=$(MY_GID) \
-	  -f centos7-build.Dockerfile \
+	  -f centos7-build.Dockerfile$(ARCHTAG) \
 	  -t calico-build/centos7 .
+
+ifeq ("$(ARCH)","ppc64le")
+	# Some commands that would typically be run at container build time must be run in a privileged container.
+	@-docker rm -f centos7Tmp
+	docker run --privileged --name=centos7Tmp calico-build/centos7 \
+		/bin/bash -c "/setup-user; /install-centos-build-deps"
+	docker commit centos7Tmp calico-build/centos7:latest
+endif
 
 # Construct a docker image for building Centos 6 RPMs.
 .PHONY: calico-build/centos6
@@ -139,7 +167,7 @@ calico-build/centos6:
 	  docker build \
 	  --build-arg=UID=$(MY_UID) \
 	  --build-arg=GID=$(MY_GID) \
-	  -f centos6-build.Dockerfile \
+	  -f centos6-build.Dockerfile$(ARCHTAG) \
 	  -t calico-build/centos6 .
 
 # Build the calico/felix docker image, which contains only Felix.
@@ -148,7 +176,7 @@ calico/felix: bin/calico-felix
 	rm -rf docker-image/bin
 	mkdir -p docker-image/bin
 	cp bin/calico-felix docker-image/bin/
-	docker build --pull -t calico/felix docker-image
+	docker build --pull -t calico/felix$(ARCHTAG) --file ./docker-image/Dockerfile$(ARCHTAG) docker-image
 
 # Targets for Felix testing with the k8s backend and a k8s API server,
 # with k8s model resources being injected by a separate test client.
@@ -241,7 +269,9 @@ ifeq ($(GIT_COMMIT),<unknown>)
 	$(error Package builds must be done from a git working copy in order to calculate version numbers.)
 endif
 	$(MAKE) calico-build/centos7
+ifneq ("$(ARCH)","ppc64le") # no ppc64le support in centos6
 	$(MAKE) calico-build/centos6
+endif
 	utils/make-packages.sh rpm
 
 .PHONY: protobuf
@@ -250,7 +280,7 @@ protobuf: proto/felixbackend.pb.go
 # Generate the protobuf bindings for go.
 proto/felixbackend.pb.go: proto/felixbackend.proto
 	$(DOCKER_RUN_RM) -v $${PWD}/proto:/src:rw \
-	              calico/protoc \
+	              calico/protoc$(ARCHTAG) \
 	              --gogofaster_out=. \
 	              felixbackend.proto
 
@@ -288,9 +318,10 @@ bin/calico-felix: $(FELIX_GO_FILES) vendor/.up-to-date
 	@echo Building felix...
 	mkdir -p bin
 	$(DOCKER_GO_BUILD) \
-	    sh -c 'go build -v -i -o $@ -v $(LDFLAGS) "github.com/projectcalico/felix" && \
-               ( ldd bin/calico-felix 2>&1 | grep -q "Not a valid dynamic program" || \
-	             ( echo "Error: bin/calico-felix was not statically linked"; false ) )'
+	   sh -c 'go build -v -i -o $@ -v $(LDFLAGS) "github.com/projectcalico/felix" && \
+		( ldd bin/calico-felix 2>&1 | grep -q -e "Not a valid dynamic program" \
+		-e "not a dynamic executable" || \
+		( echo "Error: bin/calico-felix was not statically linked"; false ) )'
 
 bin/iptables-locker: $(FELIX_GO_FILES) vendor/.up-to-date
 	@echo Building iptables-locker...
@@ -298,12 +329,25 @@ bin/iptables-locker: $(FELIX_GO_FILES) vendor/.up-to-date
 	$(DOCKER_GO_BUILD) \
 	    sh -c 'go build -v -i -o $@ -v $(LDFLAGS) "github.com/projectcalico/felix/fv/iptables-locker"'
 
+bin/test-workload: $(FELIX_GO_FILES) vendor/.up-to-date
+	@echo Building test-workload...
+	mkdir -p bin
+	$(DOCKER_GO_BUILD) \
+	    sh -c 'go build -v -i -o $@ -v $(LDFLAGS) "github.com/projectcalico/felix/fv/test-workload"'
+
+bin/test-connection: $(FELIX_GO_FILES) vendor/.up-to-date
+	@echo Building test-connection...
+	mkdir -p bin
+	$(DOCKER_GO_BUILD) \
+	    sh -c 'go build -v -i -o $@ -v $(LDFLAGS) "github.com/projectcalico/felix/fv/test-connection"'
+
 bin/k8sfv.test: $(K8SFV_GO_FILES) vendor/.up-to-date
 	@echo Building $@...
 	$(DOCKER_GO_BUILD) \
 	    sh -c 'go test -c -o $@ ./k8sfv && \
-               ( ldd $@ 2>&1 | grep -q "Not a valid dynamic program" || \
-	             ( echo "Error: $@ was not statically linked"; false ) )'
+		( ldd $@ 2>&1 | grep -q -e "Not a valid dynamic program" \
+		-e "not a dynamic executable" || \
+		( echo "Error: $@ was not statically linked"; false ) )'
 
 dist/calico-felix/calico-felix: bin/calico-felix
 	mkdir -p dist/calico-felix/
@@ -330,15 +374,22 @@ ut combined.coverprofile: vendor/.up-to-date $(FELIX_GO_FILES)
 	@echo Running Go UTs.
 	$(DOCKER_GO_BUILD) ./utils/run-coverage
 
-fv/fv.test: vendor/.up-to-date $(FELIX_GO_FILES)
-	$(DOCKER_GO_BUILD) go test ./fv -c --tags fvtests -o fv/fv.test
+FV_TESTS=$(subst _suite_test.go,.test,$(shell find fv -name "*_suite_test.go"))
+
+$(FV_TESTS): vendor/.up-to-date $(FELIX_GO_FILES)
+	# We pre-build the FV test binaries so that we can run them
+	# outside a container and allow them to interact with docker.
+	$(DOCKER_GO_BUILD) go test ./$(shell dirname $@) -c --tags fvtests -o $@
 
 .PHONY: fv
-fv: calico/felix bin/iptables-locker fv/fv.test
+fv: calico/felix bin/iptables-locker bin/test-workload bin/test-connection $(FV_TESTS)
 	@echo Running Go FVs.
-	# For now, we pre-build the binary so that we can run it outside a container and allow it
-	# to interact with docker.
-	cd fv && ./fv.test
+	# fv.test is not expecting a container name with an ARCHTAG.
+	-docker tag calico/felix$(ARCHTAG) calico/felix
+	for t in $(FV_TESTS); do \
+	    cd $(TOPDIR)/`dirname $$t` && \
+	    ./`basename $$t` -ginkgo.slowSpecThreshold 30 || exit; \
+	done
 
 bin/check-licenses: $(FELIX_GO_FILES)
 	$(DOCKER_GO_BUILD) go build -v -i -o $@ "github.com/projectcalico/felix/check-licenses"
@@ -380,12 +431,12 @@ static-checks:
 .PHONY: ut-no-cover
 ut-no-cover: vendor/.up-to-date $(FELIX_GO_FILES)
 	@echo Running Go UTs without coverage.
-	$(DOCKER_GO_BUILD) ginkgo -r -skipPackage k8sfv $(GINKGO_OPTIONS)
+	$(DOCKER_GO_BUILD) ginkgo -r -skipPackage fv,k8sfv $(GINKGO_OPTIONS)
 
 .PHONY: ut-watch
 ut-watch: vendor/.up-to-date $(FELIX_GO_FILES)
 	@echo Watching go UTs for changes...
-	$(DOCKER_GO_BUILD) ginkgo watch -r -skipPackage k8sfv $(GINKGO_OPTIONS)
+	$(DOCKER_GO_BUILD) ginkgo watch -r -skipPackage fv,k8sfv $(GINKGO_OPTIONS)
 
 # Launch a browser with Go coverage stats for the whole project.
 .PHONY: cover-browser
