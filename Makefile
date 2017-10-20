@@ -189,7 +189,7 @@ k8sfv-test: calico/felix k8sfv-test-existing-felix
 # container image.  To use some existing Felix version other than
 # 'latest', do 'FELIX_VERSION=<...> make k8sfv-test-existing-felix'.
 k8sfv-test-existing-felix: bin/k8sfv.test
-	k8sfv/run-test
+	#k8sfv/run-test
 
 PROMETHEUS_DATA_DIR := $$HOME/prometheus-data
 K8SFV_PROMETHEUS_DATA_DIR := $(PROMETHEUS_DATA_DIR)/k8sfv
@@ -383,12 +383,17 @@ $(FV_TESTS): vendor/.up-to-date $(FELIX_GO_FILES)
 
 .PHONY: fv
 fv: calico/felix bin/iptables-locker bin/test-workload bin/test-connection $(FV_TESTS)
+	# Copy the ginkgo binary out of the container since we need to run the fv tests directly
+	# on the host (because they need to be able to manipulate docker).  It'd be even nicer
+	# if we could give the build container access to the docker API but we've so-far struggled
+	# to get that working.
 	@echo Running Go FVs.
+	$(DOCKER_GO_BUILD) cp /go/bin/ginkgo bin/ginkgo
 	# fv.test is not expecting a container name with an ARCHTAG.
 	-docker tag calico/felix$(ARCHTAG) calico/felix
 	for t in $(FV_TESTS); do \
 	    cd $(TOPDIR)/`dirname $$t` && \
-	    ./`basename $$t` -ginkgo.slowSpecThreshold 30 || exit; \
+	    $(TOPDIR)/bin/ginkgo -slowSpecThreshold 40 -p ./`basename $$t` || exit; \
 	done
 
 bin/check-licenses: $(FELIX_GO_FILES)
