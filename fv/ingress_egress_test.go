@@ -25,8 +25,8 @@ import (
 	"github.com/projectcalico/felix/fv/containers"
 	"github.com/projectcalico/felix/fv/utils"
 	"github.com/projectcalico/felix/fv/workload"
-	api "github.com/projectcalico/libcalico-go/lib/apis/v2"
-	client "github.com/projectcalico/libcalico-go/lib/clientv2"
+	api "github.com/projectcalico/libcalico-go/lib/apis/v3"
+	client "github.com/projectcalico/libcalico-go/lib/clientv3"
 )
 
 // So that we can say 'HaveConnectivityTo' without the 'workload.' prefix...
@@ -49,8 +49,8 @@ var _ = Context("with initialized Felix, etcd datastore, 3 workloads", func() {
 		defaultProfile := api.NewProfile()
 		defaultProfile.Name = "default"
 		defaultProfile.Spec.LabelsToApply = map[string]string{"default": ""}
-		defaultProfile.Spec.EgressRules = []api.Rule{{Action: api.Allow}}
-		defaultProfile.Spec.IngressRules = []api.Rule{{
+		defaultProfile.Spec.Egress = []api.Rule{{Action: api.Allow}}
+		defaultProfile.Spec.Ingress = []api.Rule{{
 			Action: api.Allow,
 			Source: api.EntityRule{Selector: "default == ''"},
 		}}
@@ -102,7 +102,7 @@ var _ = Context("with initialized Felix, etcd datastore, 3 workloads", func() {
 					Selector: w[1].NameSelector(),
 				},
 			}
-			policy.Spec.IngressRules = []api.Rule{allowFromW1}
+			policy.Spec.Ingress = []api.Rule{allowFromW1}
 			policy.Spec.Selector = w[0].NameSelector()
 			_, err := client.NetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())
@@ -128,7 +128,7 @@ var _ = Context("with initialized Felix, etcd datastore, 3 workloads", func() {
 					Selector: w[1].NameSelector(),
 				},
 			}
-			policy.Spec.EgressRules = []api.Rule{allowToW1}
+			policy.Spec.Egress = []api.Rule{allowToW1}
 			policy.Spec.Selector = w[0].NameSelector()
 			_, err := client.NetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())
@@ -154,7 +154,7 @@ var _ = Context("with initialized Felix, etcd datastore, 3 workloads", func() {
 					Selector: w[1].NameSelector(),
 				},
 			}
-			policy.Spec.IngressRules = []api.Rule{allowFromW1}
+			policy.Spec.Ingress = []api.Rule{allowFromW1}
 			policy.Spec.Selector = w[0].NameSelector()
 			policy.Spec.Types = []api.PolicyType{api.PolicyTypeIngress, api.PolicyTypeEgress}
 			_, err := client.NetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)
@@ -182,8 +182,8 @@ var _ = Context("with initialized Felix, etcd datastore, 3 workloads", func() {
 					Selector: w[1].NameSelector(),
 				},
 			}
-			policy.Spec.IngressRules = []api.Rule{allowFromW1}
-			policy.Spec.EgressRules = []api.Rule{{Action: api.Deny}}
+			policy.Spec.Ingress = []api.Rule{allowFromW1}
+			policy.Spec.Egress = []api.Rule{{Action: api.Deny}}
 			policy.Spec.Selector = w[0].NameSelector()
 		})
 

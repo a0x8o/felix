@@ -53,7 +53,7 @@ import (
 	"github.com/projectcalico/felix/rules"
 	"github.com/projectcalico/felix/statusrep"
 	"github.com/projectcalico/felix/usagerep"
-	apiv2 "github.com/projectcalico/libcalico-go/lib/apis/v2"
+	apiv3 "github.com/projectcalico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/libcalico-go/lib/backend/model"
@@ -660,55 +660,54 @@ func loadConfigFromDatastore(
 	ctx context.Context, client bapi.Client, hostname string,
 ) (globalConfig, hostConfig map[string]string, err error) {
 
-	//log.Info("Waiting for the datastore to be ready")
-	//if kv, err := datastore.Get(ctx, model.ReadyFlagKey{}, ""); err != nil {
-	//	log.WithError(err).Error("Failed to read global datastore 'Ready' flag, will retry...")
-	//	time.Sleep(1 * time.Second)
-	//	continue
-	//} else if kv.Value != true {
-	//	log.Warning("Global datastore 'Ready' flag set to false, waiting...")
-	//	time.Sleep(1 * time.Second)
-	//	continue
-	//}
-
 	// The configuration is split over 3 different resource types and 4 different resource
-	// instances in the v2 data model:
-	// -  FelixConfiguration (global): name "default"
+	// instances in the v3 data model:
 	// -  ClusterInformation (global): name "default"
+	// -  FelixConfiguration (global): name "default"
 	// -  FelixConfiguration (per-host): name "node.<hostname>"
 	// -  Node (per-host): name: <hostname>
 	// Get the global values and host specific values separately.  We re-use the updateprocessor
-	// logic to convert the single v2 resource to a set of v1 key/values.
+	// logic to convert the single v3 resource to a set of v1 key/values.
 	hostConfig = make(map[string]string)
 	globalConfig = make(map[string]string)
+	var ready bool
 	err = getAndMergeConfig(
 		ctx, client, globalConfig,
-		apiv2.KindFelixConfiguration, "default",
-		updateprocessors.NewFelixConfigUpdateProcessor(),
-	)
-	if err != nil {
-		return
-	}
-	err = getAndMergeConfig(
-		ctx, client, globalConfig,
-		apiv2.KindClusterInformation, "default",
+		apiv3.KindClusterInformation, "default",
 		updateprocessors.NewClusterInfoUpdateProcessor(),
+		&ready,
 	)
 	if err != nil {
 		return
 	}
+	if !ready {
+		// The ClusterInformation struct should contain the ready flag, if it is not set, abort.
+		err = errors.New("datastore is not ready or has not been initialised")
+		return
+	}
 	err = getAndMergeConfig(
-		ctx, client, hostConfig,
-		apiv2.KindFelixConfiguration, "node."+hostname,
+		ctx, client, globalConfig,
+		apiv3.KindFelixConfiguration, "default",
 		updateprocessors.NewFelixConfigUpdateProcessor(),
+		&ready,
 	)
 	if err != nil {
 		return
 	}
 	err = getAndMergeConfig(
 		ctx, client, hostConfig,
-		apiv2.KindNode, hostname,
+		apiv3.KindFelixConfiguration, "node."+hostname,
+		updateprocessors.NewFelixConfigUpdateProcessor(),
+		&ready,
+	)
+	if err != nil {
+		return
+	}
+	err = getAndMergeConfig(
+		ctx, client, hostConfig,
+		apiv3.KindNode, hostname,
 		updateprocessors.NewFelixNodeUpdateProcessor(),
+		&ready,
 	)
 	if err != nil {
 		return
@@ -717,13 +716,14 @@ func loadConfigFromDatastore(
 	return
 }
 
-// getAndMergeConfig gets the v2 resource configuration extracts the separate config values
-// (where each configuration value is stored in a field of the v2 resource Spec) and merges into
+// getAndMergeConfig gets the v3 resource configuration extracts the separate config values
+// (where each configuration value is stored in a field of the v3 resource Spec) and merges into
 // the supplied map, as required by our v1-style configuration loader.
 func getAndMergeConfig(
 	ctx context.Context, client bapi.Client, config map[string]string,
 	kind string, name string,
 	configConverter watchersyncer.SyncerUpdateProcessor,
+	ready *bool,
 ) error {
 	logCxt := log.WithFields(log.Fields{"kind": kind, "name": name})
 
@@ -743,7 +743,7 @@ func getAndMergeConfig(
 		}
 	}
 
-	// Re-use the update processor logic implemented for the Syncer.  We give it a v2 config
+	// Re-use the update processor logic implemented for the Syncer.  We give it a v3 config
 	// object in a KVPair and it uses the annotations defined on it to split it into v1-style
 	// KV pairs.  Log any errors - but don't fail completely to avoid cyclic restarts.
 	v1kvs, err := configConverter.Process(cfg)
@@ -754,7 +754,12 @@ func getAndMergeConfig(
 	// Loop through the converted values and update our config map with values from either the
 	// Global or Host configs.
 	for _, v1KV := range v1kvs {
-		if v1KV.Value != nil {
+		if _, ok := v1KV.Key.(model.ReadyFlagKey); ok {
+			logCxt.WithField("ready", v1KV.Value).Info("Loaded ready flag")
+			if v1KV.Value == true {
+				*ready = true
+			}
+		} else if v1KV.Value != nil {
 			switch k := v1KV.Key.(type) {
 			case model.GlobalConfigKey:
 				config[k.Name] = v1KV.Value.(string)
@@ -899,14 +904,14 @@ func (fc *DataplaneConnector) sendMessagesToDataplaneDriver() {
 				log.Warn("Felix configuration changed. Need to restart.")
 				for kNew, vNew := range msg.Config {
 					if vOld, prs := config[kNew]; !prs {
-						log.WithFields(log.Fields{"key": kNew, "value": vNew}).Warn("Key added")
+						log.WithFields(log.Fields{"key": kNew, "value": vNew}).Warn("Felix configuration changed: Key added")
 					} else if vNew != vOld {
-						log.WithFields(log.Fields{"key": kNew, "old": vOld, "new": vNew}).Warn("Key changed")
+						log.WithFields(log.Fields{"key": kNew, "old": vOld, "new": vNew}).Warn("Felix configuration changed: Key changed")
 					}
 				}
 				for kOld, vOld := range config {
 					if _, prs := config[kOld]; !prs {
-						log.WithFields(log.Fields{"key": kOld, "value": vOld}).Warn("Key deleted")
+						log.WithFields(log.Fields{"key": kOld, "value": vOld}).Warn("Felix configuration changed: Key deleted")
 					}
 				}
 				fc.shutDownProcess("config changed")

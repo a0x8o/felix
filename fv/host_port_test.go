@@ -25,8 +25,8 @@ import (
 	"github.com/projectcalico/felix/fv/metrics"
 	"github.com/projectcalico/felix/fv/utils"
 	"github.com/projectcalico/felix/fv/workload"
-	api "github.com/projectcalico/libcalico-go/lib/apis/v2"
-	client "github.com/projectcalico/libcalico-go/lib/clientv2"
+	api "github.com/projectcalico/libcalico-go/lib/apis/v3"
+	client "github.com/projectcalico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/libcalico-go/lib/numorstring"
 )
 
@@ -134,7 +134,7 @@ var _ = Context("with initialized Felix and etcd datastore", func() {
 						Ports: []numorstring.Port{numorstring.SinglePort(uint16(metrics.Port))},
 					},
 				}
-				policy.Spec.IngressRules = []api.Rule{allowMetricsPortRule}
+				policy.Spec.Ingress = []api.Rule{allowMetricsPortRule}
 				policy.Spec.Selector = "host-endpoint=='true'"
 				_, err := client.GlobalNetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)
 				Expect(err).NotTo(HaveOccurred())
