@@ -144,6 +144,22 @@ func main() {
 	buildInfoLogCxt.Info("Felix starting up")
 	log.Infof("Command line arguments: %v", arguments)
 
+	// Health monitoring, for liveness and readiness endpoints.  The following loop can take a
+	// while before the datastore reports itself as ready - for example when there is data that
+	// needs to be migrated from a previous version - and we still want to Felix to report
+	// itself as live (but not ready) while we are waiting for that.  So we create the
+	// aggregator upfront and will start serving health status over HTTP as soon as we see _any_
+	// config that indicates that.
+	healthAggregator := health.NewHealthAggregator()
+
+	const healthName = "felix-startup"
+
+	// Register this function as a reporter of liveness and readiness, with no timeout.
+	healthAggregator.RegisterReporter(healthName, &health.HealthReport{Live: true, Ready: true}, 0)
+
+	// Make an initial report that says we're live but not yet ready.
+	healthAggregator.Report(healthName, &health.HealthReport{Live: true, Ready: false})
+
 	// Load the configuration from all the different sources including the
 	// datastore and merge. Keep retrying on failure.  We'll sit in this
 	// loop until the datastore is ready.
@@ -151,8 +167,16 @@ func main() {
 	var backendClient bapi.Client
 	var configParams *config.Config
 	var typhaAddr string
+	var numClientsCreated int
 configRetry:
 	for {
+		if numClientsCreated > 60 {
+			// If we're in a restart loop, periodically exit (so we can be restarted) since
+			// - it may solve the problem if there's something wrong with our process
+			// - it prevents us from leaking connections to the datastore.
+			exitWithCustomRC(configChangedRC, "Restarting to avoid leaking datastore connections")
+		}
+
 		// Load locally-defined config, including the datastore connection
 		// parameters. First the environment variables.
 		configParams = config.New()
@@ -182,6 +206,10 @@ configRetry:
 			continue configRetry
 		}
 
+		// Each time round this loop, check that we're serving health reports if we should
+		// be, or cancel any existing server if we should not be serving any more.
+		healthAggregator.ServeHTTP(configParams.HealthEnabled, configParams.HealthPort)
+
 		// We should now have enough config to connect to the datastore
 		// so we can load the remainder of the config.
 		datastoreConfig := configParams.DatastoreConfig()
@@ -191,15 +219,23 @@ configRetry:
 			time.Sleep(1 * time.Second)
 			continue configRetry
 		}
-		globalConfig, hostConfig, err := loadConfigFromDatastore(
-			ctx, backendClient, configParams.FelixHostname)
-		if err != nil {
-			log.WithError(err).Error("Failed to get config from datastore")
-			time.Sleep(1 * time.Second)
-			continue configRetry
+		numClientsCreated++
+		for {
+			globalConfig, hostConfig, err := loadConfigFromDatastore(
+				ctx, backendClient, configParams.FelixHostname)
+			if err == ErrNotReady {
+				log.Warn("Waiting for datastore to be initialized (or migrated)")
+				time.Sleep(1 * time.Second)
+				continue
+			} else if err != nil {
+				log.WithError(err).Error("Failed to get config from datastore")
+				time.Sleep(1 * time.Second)
+				continue configRetry
+			}
+			configParams.UpdateFrom(globalConfig, config.DatastoreGlobal)
+			configParams.UpdateFrom(hostConfig, config.DatastorePerHost)
+			break
 		}
-		configParams.UpdateFrom(globalConfig, config.DatastoreGlobal)
-		configParams.UpdateFrom(hostConfig, config.DatastorePerHost)
 		configParams.Validate()
 		if configParams.Err != nil {
 			log.WithError(configParams.Err).Error(
@@ -219,6 +255,7 @@ configRetry:
 			time.Sleep(1 * time.Second)
 			continue configRetry
 		}
+		numClientsCreated++
 
 		// If we're configured to discover Typha, do that now so we can retry if we fail.
 		typhaAddr, err = discoverTyphaAddr(configParams)
@@ -231,6 +268,18 @@ configRetry:
 		break configRetry
 	}
 
+	if numClientsCreated > 2 {
+		// We don't have a way to close datastore connection so, if we reconnected after
+		// a failure to load config, restart felix to avoid leaking connections.
+		exitWithCustomRC(configChangedRC, "Restarting to avoid leaking datastore connections")
+	}
+
+	// We're now both live and ready.
+	healthAggregator.Report(healthName, &health.HealthReport{Live: true, Ready: true})
+
+	// Enable or disable the health HTTP server according to coalesced config.
+	healthAggregator.ServeHTTP(configParams.HealthEnabled, configParams.HealthPort)
+
 	// If we get here, we've loaded the configuration successfully.
 	// Update log levels before we do anything else.
 	logutils.ConfigureLogging(configParams)
@@ -238,9 +287,6 @@ configRetry:
 	// again.
 	buildInfoLogCxt.WithField("config", configParams).Info(
 		"Successfully loaded configuration.")
-
-	// Health monitoring, for liveness and readiness endpoints.
-	healthAggregator := health.NewHealthAggregator()
 
 	// Start up the dataplane driver.  This may be the internal go-based driver or an external
 	// one.
@@ -413,11 +459,6 @@ configRetry:
 		go servePrometheusMetrics(configParams)
 	}
 
-	if configParams.HealthEnabled {
-		log.WithField("port", configParams.HealthPort).Info("Health enabled.  Starting server.")
-		go healthAggregator.ServeHTTP(configParams.HealthPort)
-	}
-
 	// On receipt of SIGUSR1, write out heap profile.
 	logutils.DumpHeapMemoryOnSignal(configParams)
 
@@ -535,11 +576,7 @@ func monitorAndManageShutdown(failureReportChan <-chan string, driverCmd *exec.C
 			time.Sleep(2 * time.Second)
 
 			if reason == reasonConfigChanged {
-				// We want to exit with a specific RC, but if we call Fatal() it will exit for us
-				// with the wrong RC. We need to call Fatal or Panic to force the log to be flushed
-				// so call Panic() but use defer to force an exit before the stack trace is printed.
-				defer os.Exit(configChangedRC)
-				logCxt.Panic("Exiting for config change")
+				exitWithCustomRC(configChangedRC, "Exiting for config change")
 				return
 			}
 
@@ -559,6 +596,20 @@ func monitorAndManageShutdown(failureReportChan <-chan string, driverCmd *exec.C
 
 	logCxt.Fatal("Exiting immediately")
 }
+
+func exitWithCustomRC(rc int, message string) {
+	// To ensure that the logs get flushed, we need to exit with Panic() or Fatal().
+	// However, Fatal() doesn't let us set a custom RC.  To work around that, we create a panic,
+	// but then intercept it and exit with the desired RC.
+	log.WithField("rc", rc).Info("Exiting with custom RC")
+	defer os.Exit(rc)
+	log.Panic(message)
+	panic(message) // defensive.
+}
+
+var (
+	ErrNotReady = errors.New("datastore is not ready or has not been initialised")
+)
 
 func loadConfigFromDatastore(
 	ctx context.Context, client bapi.Client, hostname string,
@@ -586,7 +637,7 @@ func loadConfigFromDatastore(
 	}
 	if !ready {
 		// The ClusterInformation struct should contain the ready flag, if it is not set, abort.
-		err = errors.New("datastore is not ready or has not been initialised")
+		err = ErrNotReady
 		return
 	}
 	err = getAndMergeConfig(
