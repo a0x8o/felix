@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2018 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ import (
 	"syscall"
 	"time"
 
-	docopt "github.com/docopt/docopt-go"
+	"github.com/docopt/docopt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -36,12 +36,14 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/projectcalico/felix/binder"
 	"github.com/projectcalico/felix/buildinfo"
 	"github.com/projectcalico/felix/calc"
 	"github.com/projectcalico/felix/config"
 	_ "github.com/projectcalico/felix/config"
 	dp "github.com/projectcalico/felix/dataplane"
 	"github.com/projectcalico/felix/logutils"
+	"github.com/projectcalico/felix/policysync"
 	"github.com/projectcalico/felix/proto"
 	"github.com/projectcalico/felix/statusrep"
 	"github.com/projectcalico/felix/usagerep"
@@ -294,11 +296,14 @@ configRetry:
 	var dpDriver dp.DataplaneDriver
 	var dpDriverCmd *exec.Cmd
 
-	dpDriver, dpDriverCmd = dp.StartDataplaneDriver(configParams, healthAggregator)
+	failureReportChan := make(chan string)
+	configChangedRestartCallback := func() { failureReportChan <- reasonConfigChanged }
+
+	dpDriver, dpDriverCmd = dp.StartDataplaneDriver(configParams, healthAggregator, configChangedRestartCallback)
 
 	// Initialise the glue logic that connects the calculation graph to/from the dataplane driver.
 	log.Info("Connect to the dataplane driver.")
-	failureReportChan := make(chan string)
+
 	var connToUsageRepUpdChan chan map[string]string
 	if configParams.UsageReportingEnabled {
 		// Make a channel for the connector to use to send updates to the usage reporter.
@@ -306,6 +311,27 @@ configRetry:
 		connToUsageRepUpdChan = make(chan map[string]string, 1)
 	}
 	dpConnector := newConnector(configParams, connToUsageRepUpdChan, backendClient, dpDriver, failureReportChan)
+
+	// If enabled, create a server for the policy sync API.  This allows clients to connect to
+	// Felix over a socket and receive policy updates.
+	var policySyncServer *policysync.Server
+	var policySyncProcessor *policysync.Processor
+	var policySyncAPIBinder binder.Binder
+	calcGraphClientChannels := []chan<- interface{}{dpConnector.ToDataplane}
+	if configParams.PolicySyncPathPrefix != "" {
+		log.WithField("policySyncPathPrefix", configParams.PolicySyncPathPrefix).Info(
+			"Policy sync API enabled.  Creating the policy sync server.")
+		toPolicySync := make(chan interface{})
+		policySyncUIDAllocator := policysync.NewUIDAllocator()
+		policySyncProcessor = policysync.NewProcessor(toPolicySync)
+		policySyncServer = policysync.NewServer(
+			policySyncProcessor.JoinUpdates,
+			policySyncUIDAllocator.NextUID,
+		)
+		policySyncAPIBinder = binder.NewBinder(configParams.PolicySyncPathPrefix)
+		policySyncServer.RegisterGrpc(policySyncAPIBinder.Server())
+		calcGraphClientChannels = append(calcGraphClientChannels, toPolicySync)
+	}
 
 	// Now create the calculation graph, which receives updates from the
 	// datastore and outputs dataplane updates for the dataplane driver.
@@ -348,7 +374,11 @@ configRetry:
 	// Create the ipsets/active policy calculation graph, which will
 	// do the dynamic calculation of ipset memberships and active policies
 	// etc.
-	asyncCalcGraph := calc.NewAsyncCalcGraph(configParams, dpConnector.ToDataplane, healthAggregator)
+	asyncCalcGraph := calc.NewAsyncCalcGraph(
+		configParams,
+		calcGraphClientChannels,
+		healthAggregator,
+	)
 
 	if configParams.UsageReportingEnabled {
 		// Usage reporting enabled, add stats collector to graph.  When it detects an update
@@ -441,6 +471,15 @@ configRetry:
 
 	// Start communicating with the dataplane driver.
 	dpConnector.Start()
+
+	if policySyncProcessor != nil {
+		log.WithField("policySyncPathPrefix", configParams.PolicySyncPathPrefix).Info(
+			"Policy sync API enabled.  Starting the policy sync server.")
+		policySyncProcessor.Start()
+		sc := make(chan bool)
+		stopSignalChans = append(stopSignalChans, sc)
+		go policySyncAPIBinder.SearchAndBind(sc)
+	}
 
 	// Send the opening message to the dataplane driver, giving it its
 	// config.
