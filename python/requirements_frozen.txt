@@ -10,7 +10,7 @@ greenlet==0.4.10
 grpcio==1.0.0
 hypothesis==3.5.3
 inflect==0.2.5
-Jinja2==2.8
+Jinja2==2.11.3
 jinja2-pluralize==0.3.0
 linecache2==1.0.0
 MarkupSafe==0.23
