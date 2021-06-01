@@ -33,6 +33,6 @@ tox==2.4.1
 traceback2==1.4.0
 uncompyle6==2.9.3
 unittest2==1.1.0
-urllib3==1.18
+urllib3==1.26.5
 virtualenv==15.0.3
 xdis==3.2.0
