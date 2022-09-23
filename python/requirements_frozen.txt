@@ -21,7 +21,7 @@ pbr==1.10.0
 pluggy==0.4.0
 posix-spawn==0.2.post7
 prometheus-client==0.0.17
-protobuf==3.1.0.post1
+protobuf==3.18.3
 py==1.4.31
 pycparser==2.14
 Pygments==2.1.3
